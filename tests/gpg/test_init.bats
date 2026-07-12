@@ -99,12 +99,3 @@ load "$BATS_TEST_DIRNAME/_gpg_helper.bash"
   [[ "$output" = *"not usable"* ]]
 }
 
-@test "init: uninstall leaves decrypted file in working copy" {
-  encrypt_named_file sensitive_file "my secret"
-
-  run $TRANSCRYPT --uninstall --yes
-  [ "$status" -eq 0 ]
-
-  run cat sensitive_file
-  [ "${lines[0]}" = "my secret" ]
-}

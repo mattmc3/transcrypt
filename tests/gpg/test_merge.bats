@@ -2,24 +2,6 @@
 
 load "$BATS_TEST_DIRNAME/_gpg_helper.bash"
 
-@test "merge: branches with encrypted file - addition, no conflict" {
-  echo "1. First step" > sensitive_file
-  encrypt_named_file sensitive_file
-
-  git checkout -b branch-2
-  echo "2. Second step" >> sensitive_file
-  git add sensitive_file
-  git commit -m "Add line 2"
-
-  git checkout -
-  git merge branch-2
-
-  run cat sensitive_file
-  [ "$status" -eq 0 ]
-  [ "${lines[0]}" = "1. First step" ]
-  [ "${lines[1]}" = "2. Second step" ]
-}
-
 @test "merge: branches with encrypted file - line changes both branches, no conflict" {
   echo "1. First step" > sensitive_file
   echo "2. Second step" >> sensitive_file

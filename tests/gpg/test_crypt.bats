@@ -5,13 +5,6 @@ load "$BATS_TEST_DIRNAME/_gpg_helper.bash"
 SECRET_CONTENT="My secret content"
 PGP_HEADER="-----BEGIN PGP MESSAGE-----"
 
-@test "crypt: encrypted file is decrypted in working copy" {
-  encrypt_named_file sensitive_file "$SECRET_CONTENT"
-  run cat sensitive_file
-  [ "$status" -eq 0 ]
-  [ "${lines[0]}" = "$SECRET_CONTENT" ]
-}
-
 @test "crypt: file is PGP armored in git" {
   encrypt_named_file sensitive_file "$SECRET_CONTENT"
   run git show HEAD:sensitive_file --no-textconv
@@ -19,32 +12,10 @@ PGP_HEADER="-----BEGIN PGP MESSAGE-----"
   [ "${lines[0]}" = "$PGP_HEADER" ]
 }
 
-@test "crypt: git show --textconv decrypts" {
-  encrypt_named_file sensitive_file "$SECRET_CONTENT"
-  run git show HEAD:sensitive_file --textconv
-  [ "$status" -eq 0 ]
-  [ "${lines[0]}" = "$SECRET_CONTENT" ]
-}
-
 @test "crypt: ciphertext is encrypted to every recipient" {
   encrypt_named_file sensitive_file "$SECRET_CONTENT"
   count=$(git show HEAD:sensitive_file --no-textconv | recipient_count)
   [ "$count" -eq 2 ]
-}
-
-@test "crypt: unchanged file stays clean across touch and re-add" {
-  encrypt_named_file sensitive_file "$SECRET_CONTENT"
-  blob_before=$(git rev-parse HEAD:sensitive_file)
-
-  touch sensitive_file
-  git add sensitive_file
-
-  run check_repo_is_clean
-  [ "$status" -eq 0 ]
-
-  # idempotent clean reused the committed ciphertext byte-for-byte
-  blob_after=$(git rev-parse :0:sensitive_file)
-  [ "$blob_before" = "$blob_after" ]
 }
 
 @test "crypt: changed content produces a new ciphertext blob" {
@@ -184,69 +155,6 @@ PGP_HEADER="-----BEGIN PGP MESSAGE-----"
   [[ "$output" = *"encryption failed"* ]]
 }
 
-@test "crypt: handle challenging file names when 'core.quotePath=true'" {
-  git config --local --add core.quotePath true
-  FILENAME="Mig – røve"  # Danish
-
-  encrypt_named_file "$FILENAME" "$SECRET_CONTENT"
-
-  run cat "$FILENAME"
-  [ "$status" -eq 0 ]
-  [ "${lines[0]}" = "$SECRET_CONTENT" ]
-
-  run git show HEAD:"$FILENAME" --no-textconv
-  [ "$status" -eq 0 ]
-  [ "${lines[0]}" = "$PGP_HEADER" ]
-
-  run git ls-crypt
-  [ "$status" -eq 0 ]
-  [[ "${output}" = *"$FILENAME" ]]
-}
-
-@test "crypt: handle file name with quotes and brackets" {
-  FILENAME='"Difficult file name""")))(((][][].secret'
-  echo "$SECRET_CONTENT" > "$FILENAME"
-  echo "*.secret filter=crypt diff=crypt merge=crypt" >> .gitattributes
-  git add .gitattributes "$FILENAME"
-  git commit -m "Encrypt difficult filename"
-
-  run cat "$FILENAME"
-  [ "$status" -eq 0 ]
-  [ "${lines[0]}" = "$SECRET_CONTENT" ]
-
-  run git show HEAD:"\"Difficult file name\"\"\")))(((][][].secret" --no-textconv
-  [ "$status" -eq 0 ]
-  [ "${lines[0]}" = "$PGP_HEADER" ]
-
-  rm -f "$FILENAME"
-}
-
-@test "crypt: handle very small file" {
-  FILENAME="small file.txt"
-  SMALL_CONTENT="sh"
-
-  encrypt_named_file "$FILENAME" "$SMALL_CONTENT"
-
-  run git show HEAD:"$FILENAME" --no-textconv
-  [ "$status" -eq 0 ]
-  [ "${lines[0]}" = "$PGP_HEADER" ]
-
-  run git show HEAD:"$FILENAME" --textconv
-  [ "$status" -eq 0 ]
-  [ "${lines[0]}" = "$SMALL_CONTENT" ]
-}
-
-@test "crypt: empty file is stored empty, not encrypted" {
-  touch empty_file
-  encrypt_named_file empty_file
-
-  # by design: an empty file has nothing to protect and stays empty,
-  # which also means emptiness itself is visible in the repository
-  run git show HEAD:empty_file --no-textconv
-  [ "$status" -eq 0 ]
-  [ "$output" = "" ]
-}
-
 @test "crypt: --add marks gpg patterns -text to block eol conversion" {
   run $TRANSCRYPT --add='*.secret'
   [ "$status" -eq 0 ]
@@ -276,20 +184,3 @@ PGP_HEADER="-----BEGIN PGP MESSAGE-----"
   [[ "$output" != *"PASSWORD"* ]]
 }
 
-@test "crypt: handle file with problematic bytes" {
-  FILENAME="problem bytes file.txt"
-  printf "\375 \0 shh" > "$FILENAME"
-  encrypt_named_file "$FILENAME"
-
-  run git show HEAD:"$FILENAME" --no-textconv
-  [ "$status" -eq 0 ]
-  [ "${lines[0]}" = "$PGP_HEADER" ]
-
-  # checkout round trip preserves bytes
-  cp "$FILENAME" "$BATS_TEST_TMPDIR/original"
-  rm "$FILENAME"
-  git checkout --force -- "$FILENAME"
-  run cmp "$FILENAME" "$BATS_TEST_TMPDIR/original"
-  rm -f "$FILENAME"
-  [ "$status" -eq 0 ]
-}

@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Run the transcrypt test suites.
+#
+#   tests/run                 everything: all suites, conformance per format
+#   tests/run openssl         upstream suite + openssl conformance
+#   tests/run gpg             gpg suite + gpg conformance
+#   tests/run pbkdf2          pbkdf2 suite + pbkdf2 conformance
+#   tests/run conformance     conformance suite for every format
+#
+# Parallelism uses `bats --jobs` when GNU parallel is installed
+# (brew/apt install parallel); set BATS_JOBS to override the job count.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+bats=(bats)
+if command -v parallel >/dev/null 2>&1; then
+	jobs=${BATS_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)}
+	bats+=(--jobs "$jobs")
+fi
+
+run_conformance() {
+	echo "=== conformance: $1 ==="
+	TRANSCRYPT_TEST_FORMAT=$1 "${bats[@]}" tests/conformance/
+}
+
+case ${1:-all} in
+all)
+	"${bats[@]}" tests/ tests/gpg/ tests/pbkdf2/
+	for fmt in openssl gpg pbkdf2; do
+		run_conformance "$fmt"
+	done
+	;;
+openssl)
+	"${bats[@]}" tests/
+	run_conformance openssl
+	;;
+gpg)
+	"${bats[@]}" tests/gpg/
+	run_conformance gpg
+	;;
+pbkdf2)
+	"${bats[@]}" tests/pbkdf2/
+	run_conformance pbkdf2
+	;;
+conformance)
+	for fmt in openssl gpg pbkdf2; do
+		run_conformance "$fmt"
+	done
+	;;
+*)
+	echo "usage: tests/run [all|openssl|gpg|pbkdf2|conformance]" >&2
+	exit 1
+	;;
+esac
