@@ -130,9 +130,11 @@ PGP_HEADER="-----BEGIN PGP MESSAGE-----"
   [ "$status" -eq 0 ]
   [ "${lines[0]}" = "$PGP_HEADER" ]
 
-  # round trip preserves bytes
-  git show HEAD:"$FILENAME" --textconv > /tmp/roundtrip.$$
-  run cmp "$FILENAME" /tmp/roundtrip.$$
-  rm -f /tmp/roundtrip.$$ "$FILENAME"
+  # checkout round trip preserves bytes
+  cp "$FILENAME" "$BATS_TEST_TMPDIR/original"
+  rm "$FILENAME"
+  git checkout --force -- "$FILENAME"
+  run cmp "$FILENAME" "$BATS_TEST_TMPDIR/original"
+  rm -f "$FILENAME"
   [ "$status" -eq 0 ]
 }

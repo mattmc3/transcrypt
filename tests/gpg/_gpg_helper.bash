@@ -30,6 +30,9 @@ function init_transcrypt_gpg {
 function setup {
   pushd "$BATS_TEST_DIRNAME" || exit 1
   init_git_repo
+  # a globally configured signing key is not in the ephemeral keyring;
+  # sign with a test key instead so commit.gpgsign still works
+  git config --local user.signingkey "$ALICE"
   if [[ ! "$SETUP_SKIP_INIT_TRANSCRYPT" ]]; then
     init_transcrypt_gpg
   fi

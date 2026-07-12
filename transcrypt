@@ -333,9 +333,118 @@ hex_to_bin() {
 	fi
 }
 
+##### GPG FORMAT
+#
+# The gpg format encrypts to the public keys of one or more recipients
+# instead of deriving a symmetric key from a shared password. GPG output is
+# not deterministic (random session key and prefix), so the clean filter
+# stays idempotent a different way: it reuses the ciphertext already staged
+# in the index whenever that ciphertext decrypts to exactly the incoming
+# plaintext, and only encrypts afresh on a real content change.
+
+# return true if the repository is configured for the gpg format
+is_gpg_format() {
+	[[ "$(git config --get --local transcrypt.format 2>/dev/null || true)" == 'gpg' ]]
+}
+
+# run gpg, honoring an alternate keyring set via transcrypt.gnupghome
+gpg_cmd() {
+	local gnupghome
+	gnupghome=$(git config --get --local transcrypt.gnupghome 2>/dev/null || true)
+	if [[ $gnupghome ]]; then
+		GNUPGHOME=$gnupghome gpg "$@"
+	else
+		gpg "$@"
+	fi
+}
+
+# encrypt the file named by $1 to stdout, for every configured recipient
+gpg_encrypt_file() {
+	local infile=$1
+	local recipient
+	local recipient_args=()
+	while IFS= read -r recipient; do
+		if [[ $recipient ]]; then
+			recipient_args+=(--recipient "$recipient")
+		fi
+	done < <(git config --get-all --local transcrypt.gpg-recipient 2>/dev/null || true)
+	if [[ ${#recipient_args[@]} -eq 0 ]]; then
+		die 1 'no gpg recipients configured; set transcrypt.gpg-recipient'
+	fi
+	gpg_cmd --batch --quiet --yes --trust-model always --armor --encrypt \
+		"${recipient_args[@]}" --output - -- "$infile"
+}
+
+# ensure recipients were given (or are already configured) and exist in the keyring
+validate_gpg_recipients() {
+	command -v gpg >/dev/null || die 'required command "gpg" was not found'
+	if [[ ${#gpg_recipients[@]} -eq 0 ]]; then
+		local existing
+		existing=$(git config --get-all --local transcrypt.gpg-recipient 2>/dev/null || true)
+		if [[ $existing ]]; then
+			return 0
+		fi
+		die 1 'the gpg format requires at least one recipient; use --gpg-recipient=KEYID'
+	fi
+	local recipient
+	for recipient in "${gpg_recipients[@]}"; do
+		gpg_cmd --list-keys -- "$recipient" >/dev/null 2>&1 ||
+			die 1 'gpg recipient key "%s" was not found in the keyring' "$recipient"
+	done
+}
+
+git_clean_gpg() {
+	filename=$1
+	# ignore empty files
+	if [[ ! -s $filename ]]; then
+		return
+	fi
+	tempfile=$(mktemp 2>/dev/null || mktemp -t tmp)
+	oldfile=$(mktemp 2>/dev/null || mktemp -t tmp)
+	trap 'rm -f "$tempfile" "$oldfile"' EXIT
+	tee "$tempfile" &>/dev/null
+	# already-encrypted input passes through untouched
+	firstbytes=$(head -c8 "$tempfile" | LC_ALL=C tr -d '\0')
+	if [[ $firstbytes == '-----BEG' ]]; then
+		cat "$tempfile"
+		return
+	fi
+	# reuse the index ciphertext when it decrypts to the incoming plaintext,
+	# so unchanged files produce stable clean output; TRANSCRYPT_GPG_REKEY
+	# bypasses the reuse to force re-encryption with current recipients
+	if [[ ! "${TRANSCRYPT_GPG_REKEY:-}" ]] &&
+		git cat-file blob ":0:$filename" >"$oldfile" 2>/dev/null &&
+		[[ "$(head -c8 "$oldfile" | LC_ALL=C tr -d '\0')" == '-----BEG' ]] &&
+		gpg_cmd --batch --quiet --decrypt -- "$oldfile" 2>/dev/null | cmp -s - "$tempfile"; then
+		cat "$oldfile"
+		return
+	fi
+	gpg_encrypt_file "$tempfile"
+}
+
+git_smudge_gpg() {
+	tempfile=$(mktemp 2>/dev/null || mktemp -t tmp)
+	trap 'rm -f "$tempfile"' EXIT
+	tee "$tempfile" &>/dev/null
+	gpg_cmd --batch --quiet --decrypt -- "$tempfile" 2>/dev/null || cat "$tempfile"
+}
+
+git_textconv_gpg() {
+	filename=$1
+	if [[ ! -s $filename ]]; then
+		return
+	fi
+	gpg_cmd --batch --quiet --decrypt -- "$filename" 2>/dev/null || cat "$filename"
+}
+
 git_clean() {
 	context=$(extract_context_name_from_name_value_arg "$1")
 	[[ "$context" ]] && shift
+
+	if is_gpg_format; then
+		git_clean_gpg "$@"
+		return
+	fi
 
 	filename=$1
 	# ignore empty files
@@ -374,6 +483,11 @@ git_clean() {
 }
 
 git_smudge() {
+	if is_gpg_format; then
+		git_smudge_gpg
+		return
+	fi
+
 	tempfile=$(mktemp 2>/dev/null || mktemp -t tmp)
 	trap 'rm -f "$tempfile"' EXIT
 	context=$(extract_context_name_from_name_value_arg "$1")
@@ -387,6 +501,11 @@ git_smudge() {
 git_textconv() {
 	context=$(extract_context_name_from_name_value_arg "$1")
 	[[ "$context" ]] && shift
+
+	if is_gpg_format; then
+		git_textconv_gpg "$@"
+		return
+	fi
 
 	filename=$1
 	# ignore empty files
@@ -449,6 +568,11 @@ git_pre_commit() {
 	# Transcrypt pre-commit hook: fail if secret file in staging lacks the magic prefix "Salted" in B64
 	tmp=$(mktemp)
 	IFS=$'\n'
+	# the gpg format armors ciphertext with a PGP header instead
+	expected_prefix='U2FsdGVk'
+	if is_gpg_format; then
+		expected_prefix='-----BEG'
+	fi
 	slow_mode_if_failed() {
 		for secret_file in $(_list_encrypted_files); do
 			# Skip symlinks, they contain the linked target file path not plaintext
@@ -462,7 +586,7 @@ git_pre_commit() {
 			if [[ $firstbytes == "" ]]; then
 				: # Do nothing
 			# The first bytes of an encrypted file must be "Salted" in Base64
-			elif [[ $firstbytes != "U2FsdGVk" ]]; then
+			elif [[ $firstbytes != "$expected_prefix" ]]; then
 				printf 'Transcrypt managed file is not encrypted in the Git index: %s\n' "$secret_file" >&2
 				printf '\n' >&2
 				printf 'You probably staged this file using a tool that does not apply' >&2
@@ -491,7 +615,7 @@ git_pre_commit() {
 		local firstbytes=$(git show :"${secret_file}" | head -c8)
 		if [[ $firstbytes == "" ]]; then
 			: # Do nothing
-		elif [[ $firstbytes != "U2FsdGVk" ]]; then
+		elif [[ $firstbytes != "$expected_prefix" ]]; then
 			echo "true" >>"${tmp}"
 		fi
 	}
@@ -786,9 +910,22 @@ save_configuration() {
 
 	# write the encryption info
 	git config transcrypt.version "$VERSION"
-	git config "transcrypt${CONTEXT_CONFIG_GROUP}.cipher" "$cipher"
-	save_password "$password" "$CONTEXT_CONFIG_GROUP"
-	git config transcrypt.openssl-path "$openssl_path"
+	if [[ $format == 'gpg' ]]; then
+		git config transcrypt.format 'gpg'
+		# replace recipients only when new ones were given; a rekey with
+		# none given keeps the recipient list already in git config
+		if [[ ${#gpg_recipients[@]} -gt 0 ]]; then
+			git config --unset-all transcrypt.gpg-recipient 2>/dev/null || true
+			local recipient
+			for recipient in "${gpg_recipients[@]}"; do
+				git config --add transcrypt.gpg-recipient "$recipient"
+			done
+		fi
+	else
+		git config "transcrypt${CONTEXT_CONFIG_GROUP}.cipher" "$cipher"
+		save_password "$password" "$CONTEXT_CONFIG_GROUP"
+		git config transcrypt.openssl-path "$openssl_path"
+	fi
 
 	# write the filter settings. Sorry for the horrific quote escaping below...
 	# shellcheck disable=SC2016
@@ -830,8 +967,34 @@ save_configuration() {
 	git config alias.add-crypt "!$transcrypt_path --add"
 }
 
+# display the current gpg format configuration settings
+display_configuration_gpg() {
+	printf 'The current repository was configured using transcrypt version %s\n' "$INSTALLED_VERSION"
+	printf "and has the following configuration%s:\n\n" "$CONTEXT_DESCRIPTION"
+	[[ ! $REPO ]] || printf '  GIT_WORK_TREE:  %s\n' "$REPO"
+	printf '  GIT_DIR:        %s\n' "$GIT_DIR"
+	printf '  GIT_ATTRIBUTES: %s\n\n' "$GIT_ATTRIBUTES"
+	printf '  CONTEXT:  %s\n' "$CONTEXT"
+	printf '  FORMAT:   gpg\n'
+	printf '  RECIPIENTS:\n'
+	local recipient
+	while IFS= read -r recipient; do
+		if [[ $recipient ]]; then
+			printf '    %s\n' "$recipient"
+		fi
+	done < <(git config --get-all --local transcrypt.gpg-recipient 2>/dev/null || true)
+	printf '\nTo initialize a cloned repository, import the recipient keys into your\n'
+	printf 'gpg keyring and run:\n\n'
+	printf '  transcrypt --format=gpg\n'
+}
+
 # display the current configuration settings
 display_configuration() {
+	if is_gpg_format; then
+		display_configuration_gpg
+		return
+	fi
+
 	local current_cipher
 	current_cipher=$(git config --get --local "transcrypt${CONTEXT_CONFIG_GROUP}.cipher")
 	local current_password
@@ -1251,6 +1414,10 @@ get_contexts_from_git_config() {
 	for name in $config_names; do
 		if [[ "$name" = "transcrypt.password" ]]; then
 			contexts+=('default')
+		elif [[ "$name" = "transcrypt.format" ]]; then
+			# the gpg format stores no password; the format key marks the
+			# default context as configured
+			contexts+=('default')
 		elif [[ $name =~ $extract_context_name_regex ]]; then
 			contexts+=("${BASH_REMATCH[1]}")
 		fi
@@ -1391,6 +1558,15 @@ help() {
 		     -p, --password=PASSWORD
 		            the password to derive the key from;
 		            defaults to 30 random base64 characters
+
+		     --format=FORMAT
+		            encryption format: 'legacy' (OpenSSL symmetric cipher) or
+		            'gpg' (encrypt to gpg recipient public keys)
+
+		     --gpg-recipient=KEYID
+		            gpg key to encrypt to; repeat for multiple recipients.
+		            Requires --format=gpg. Keys must be in the gpg keyring
+		            (set transcrypt.gnupghome to use an alternate keyring)
 
 		     --set-openssl-path=PATH_TO_OPENSSL
 		            use OpenSSL at this path; defaults to 'openssl' in \$PATH
@@ -1538,8 +1714,10 @@ display_config=''
 add_pattern=''
 list_contexts_command=''
 flush_creds=''
+format=''
 gpg_import_file=''
 gpg_recipient=''
+gpg_recipients=()
 interactive='true'
 list=''
 password=''
@@ -1616,6 +1794,24 @@ while [[ "${1:-}" != '' ]]; do
 		;;
 	--context=*)
 		context=${1#*=}
+		;;
+	--format)
+		format=${2:-}
+		[[ $format ]] || die 1 'empty format'
+		shift
+		;;
+	--format=*)
+		format=${1#*=}
+		[[ $format ]] || die 1 'empty format'
+		;;
+	--gpg-recipient)
+		[[ ${2:-} ]] || die 1 'empty gpg recipient'
+		gpg_recipients+=("$2")
+		shift
+		;;
+	--gpg-recipient=*)
+		[[ ${1#*=} ]] || die 1 'empty gpg recipient'
+		gpg_recipients+=("${1#*=}")
 		;;
 	--set-openssl-path=*)
 		openssl_path=${1#*=}
@@ -1781,9 +1977,22 @@ count_dirty_files() {
 # shellcheck disable=SC2155
 readonly GIT_DIRTY_FILES_BEFORE_INIT="$(count_dirty_files)"
 
+# resolve the target format: explicit flag wins, else any configured format
+if [[ ! $format ]] && is_gpg_format; then
+	format='gpg'
+fi
+case $format in
+'' | legacy | gpg) ;;
+*) die 1 'unsupported format: %s' "$format" ;;
+esac
+
 # perform function calls to configure transcrypt
-get_cipher
-get_password
+if [[ $format == 'gpg' ]]; then
+	validate_gpg_recipients
+else
+	get_cipher
+	get_password
+fi
 
 if [[ $rekey ]] && [[ $interactive ]]; then
 	confirm_rekey
@@ -1794,6 +2003,12 @@ fi
 save_configuration
 
 if [[ $rekey ]]; then
+	if [[ $format == 'gpg' ]]; then
+		# force the clean filter to re-encrypt with the current recipients
+		# instead of reusing index ciphertext
+		TRANSCRYPT_GPG_REKEY='true'
+		export TRANSCRYPT_GPG_REKEY
+	fi
 	stage_rekeyed_files
 else
 	force_checkout
