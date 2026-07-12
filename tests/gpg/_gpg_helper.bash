@@ -51,12 +51,22 @@ function make_empty_gnupghome {
 # GNUPGHOME containing only public keys
 function make_pubkey_only_home {
   local home
-  home=$(mktemp -d /tmp/tc-pub.XXXXXX)
-  chmod 700 "$home"
-  register_scratch_gnupghome "$home"
+  home=$(make_empty_gnupghome)
   gpg --export --armor -- "$ALICE" "$BOB" |
     GNUPGHOME=$home gpg --batch --quiet --import 2>/dev/null
   echo "$home"
+}
+
+# Corrupt PGP armor read on stdin: keep the header line, change one body
+# byte so the armor CRC no longer matches
+function corrupt_armor {
+  awk 'NR==3 {c=substr($0,1,1); $0=(c=="A"?"B":"A") substr($0,2)} {print}'
+}
+
+# Key ids a ciphertext (stdin) is encrypted to, one per line
+function keyids_of {
+  gpg --list-packets --list-only 2>/dev/null |
+    sed -n 's/.*keyid \([0-9A-Fa-f]*\).*/\1/p'
 }
 
 function teardown {

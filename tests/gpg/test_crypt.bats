@@ -68,7 +68,7 @@ PGP_HEADER="-----BEGIN PGP MESSAGE-----"
 @test "crypt: clean passes already-encrypted input through unchanged" {
   encrypt_named_file sensitive_file "$SECRET_CONTENT"
   git show HEAD:sensitive_file --no-textconv > /tmp/ciphertext.$$
-  run bash -c "$TRANSCRYPT clean context=default sensitive_file < /tmp/ciphertext.$$"
+  run bash -c "$TRANSCRYPT clean context=default format=gpg sensitive_file < /tmp/ciphertext.$$"
   rm -f /tmp/ciphertext.$$
   [ "$status" -eq 0 ]
   [ "${lines[0]}" = "$PGP_HEADER" ]
@@ -78,7 +78,7 @@ PGP_HEADER="-----BEGIN PGP MESSAGE-----"
   encrypt_named_file sensitive_file "$SECRET_CONTENT"
   emptyhome=$(make_empty_gnupghome)
   run bash -c "git show HEAD:sensitive_file --no-textconv |
-    GNUPGHOME='$emptyhome' $TRANSCRYPT smudge context=default"
+    GNUPGHOME='$emptyhome' $TRANSCRYPT smudge context=default format=gpg"
   [ "$status" -eq 0 ]
   [ "${lines[0]}" = "$PGP_HEADER" ]
 }

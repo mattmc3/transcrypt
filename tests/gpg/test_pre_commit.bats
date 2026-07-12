@@ -23,8 +23,7 @@ load "$BATS_TEST_DIRNAME/_gpg_helper.bash"
 
   # simulate a hand-edit: header intact, one body byte changed (breaks
   # the armor CRC), staged without the clean filter as a raw editor would
-  git show HEAD:sensitive_file |
-    awk 'NR==3 {c=substr($0,1,1); $0=(c=="A"?"B":"A") substr($0,2)} {print}' > sensitive_file
+  git show HEAD:sensitive_file | corrupt_armor > sensitive_file
   echo "" > .gitattributes
   git add sensitive_file
   echo "sensitive_file filter=crypt diff=crypt merge=crypt" > .gitattributes
@@ -43,8 +42,7 @@ load "$BATS_TEST_DIRNAME/_gpg_helper.bash"
 
   # commit a corrupted blob, bypassing the clean filter and the hook,
   # the way a collaborator without transcrypt configured would
-  git show HEAD:sensitive_file |
-    awk 'NR==3 {c=substr($0,1,1); $0=(c=="A"?"B":"A") substr($0,2)} {print}' > sensitive_file
+  git show HEAD:sensitive_file | corrupt_armor > sensitive_file
   echo "" > .gitattributes
   git add sensitive_file
   git commit -m "corrupted" --no-verify

@@ -48,9 +48,7 @@ load "$BATS_TEST_DIRNAME/_gpg_helper.bash"
   [ "$status" -ne 0 ]
   [[ "$output" = *"encrypted to"* ]]
   # hint must include the keyid of at least one existing recipient
-  keyid=$(git show HEAD:sensitive_file |
-    gpg --list-packets --list-only 2>/dev/null |
-    sed -n 's/.*keyid \([0-9A-F]*\).*/\1/p' | head -1)
+  keyid=$(git show HEAD:sensitive_file | keyids_of | head -1)
   [[ "$output" = *"$keyid"* ]]
 }
 
