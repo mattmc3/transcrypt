@@ -14,6 +14,12 @@ setup_suite() {
     gpg --batch --pinentry-mode loopback --passphrase '' \
       --quick-gen-key "$uid" default default never
   done
+
+  # canonical fingerprints, for asserting normalized recipient storage
+  export ALICE_FPR BOB_FPR CHARLIE_FPR
+  ALICE_FPR=$(fpr_of "$ALICE")
+  BOB_FPR=$(fpr_of "$BOB")
+  CHARLIE_FPR=$(fpr_of "$CHARLIE")
 }
 
 teardown_suite() {

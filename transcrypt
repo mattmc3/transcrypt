@@ -375,22 +375,74 @@ gpg_encrypt_file() {
 		"${recipient_args[@]}" --output - -- "$infile"
 }
 
-# ensure recipients were given (or are already configured) and exist in the keyring
+# resolve a recipient identifier (email, key id, fingerprint) to the full
+# fingerprint of exactly one key in the keyring
+resolve_gpg_recipient() {
+	local ident=$1
+	local fprs
+	# primary-key fingerprints only: the fpr line following each pub line
+	fprs=$(gpg_cmd --list-keys --with-colons -- "$ident" 2>/dev/null |
+		awk -F: '$1 == "pub" {p=1} p && $1 == "fpr" {print $10; p=0}')
+	[[ $fprs ]] || die 1 'gpg recipient key "%s" was not found in the keyring' "$ident"
+	if [[ $(echo "$fprs" | wc -l) -gt 1 ]]; then
+		die 1 'gpg recipient "%s" matches more than one key; use a fingerprint' "$ident"
+	fi
+	printf '%s\n' "$fprs"
+}
+
+# fail configuration, listing the key ids existing ciphertext is encrypted to
+die_gpg_no_recipients() {
+	local hint=''
+	if [[ $HEAD_EXISTS ]]; then
+		hint=$(
+			cd "$REPO" 2>/dev/null || exit 0
+			file=$(_list_encrypted_files | head -1)
+			[[ $file ]] || exit 0
+			git show HEAD:"$file" 2>/dev/null |
+				gpg_cmd --list-packets --list-only 2>/dev/null |
+				sed -n 's/.*keyid \([0-9A-Fa-f]*\).*/\1/p' | sort -u | tr '\n' ' '
+		)
+	fi
+	if [[ $hint ]]; then
+		warn 'existing files are encrypted to key ids: %s' "$hint"
+	fi
+	die 1 'the gpg format requires at least one recipient; use --gpg-recipient=KEYID'
+}
+
+# ensure recipients were given (or are already configured), exist in the
+# keyring, and are stored as full fingerprints
 validate_gpg_recipients() {
 	command -v gpg >/dev/null || die 'required command "gpg" was not found'
-	if [[ ${#gpg_recipients[@]} -eq 0 ]]; then
-		local existing
-		existing=$(git config --get-all --local transcrypt.gpg-recipient 2>/dev/null || true)
-		if [[ $existing ]]; then
-			return 0
-		fi
-		die 1 'the gpg format requires at least one recipient; use --gpg-recipient=KEYID'
+	local resolved=()
+	local recipient fpr
+
+	if [[ ${#gpg_recipients[@]} -gt 0 ]]; then
+		for recipient in "${gpg_recipients[@]}"; do
+			fpr=$(resolve_gpg_recipient "$recipient") || exit $?
+			resolved+=("$fpr")
+		done
+		gpg_recipients=("${resolved[@]}")
+		return 0
 	fi
-	local recipient
-	for recipient in "${gpg_recipients[@]}"; do
-		gpg_cmd --list-keys -- "$recipient" >/dev/null 2>&1 ||
-			die 1 'gpg recipient key "%s" was not found in the keyring' "$recipient"
-	done
+
+	# none given: normalize whatever is already configured (eg: recipients
+	# added by hand with `git config --add` before a rekey)
+	local existing
+	existing=$(git config --get-all --local transcrypt.gpg-recipient 2>/dev/null || true)
+	[[ $existing ]] || die_gpg_no_recipients
+	local changed=''
+	while IFS= read -r recipient; do
+		[[ $recipient ]] || continue
+		fpr=$(resolve_gpg_recipient "$recipient") || exit $?
+		[[ $fpr == "$recipient" ]] || changed='true'
+		resolved+=("$fpr")
+	done <<<"$existing"
+	if [[ $changed ]]; then
+		git config --unset-all transcrypt.gpg-recipient
+		for fpr in "${resolved[@]}"; do
+			git config --add transcrypt.gpg-recipient "$fpr"
+		done
+	fi
 }
 
 git_clean_gpg() {
@@ -414,10 +466,20 @@ git_clean_gpg() {
 	# bypasses the reuse to force re-encryption with current recipients
 	if [[ ! "${TRANSCRYPT_GPG_REKEY:-}" ]] &&
 		git cat-file blob ":0:$filename" >"$oldfile" 2>/dev/null &&
-		[[ "$(head -c8 "$oldfile" | LC_ALL=C tr -d '\0')" == '-----BEG' ]] &&
-		gpg_cmd --batch --quiet --decrypt -- "$oldfile" 2>/dev/null | cmp -s - "$tempfile"; then
-		cat "$oldfile"
-		return
+		[[ "$(head -c8 "$oldfile" | LC_ALL=C tr -d '\0')" == '-----BEG' ]]; then
+		if gpg_cmd --batch --quiet --decrypt -- "$oldfile" >"$oldfile.plain" 2>/dev/null; then
+			if cmp -s -- "$oldfile.plain" "$tempfile"; then
+				rm -f "$oldfile.plain"
+				cat "$oldfile"
+				return
+			fi
+			rm -f "$oldfile.plain"
+		else
+			# encryption needs only public keys, but unchanged-detection
+			# needs a secret key; without one the blob churns on every add
+			rm -f "$oldfile.plain"
+			warn 'cannot decrypt the committed "%s" to check for changes (missing secret key?); re-encrypting' "$filename"
+		fi
 	fi
 	gpg_encrypt_file "$tempfile"
 }
@@ -977,10 +1039,12 @@ display_configuration_gpg() {
 	printf '  CONTEXT:  %s\n' "$CONTEXT"
 	printf '  FORMAT:   gpg\n'
 	printf '  RECIPIENTS:\n'
-	local recipient
+	local recipient uid
 	while IFS= read -r recipient; do
 		if [[ $recipient ]]; then
-			printf '    %s\n' "$recipient"
+			uid=$(gpg_cmd --list-keys --with-colons -- "$recipient" 2>/dev/null |
+				awk -F: '/^uid/ {print $10; exit}')
+			printf '    %s  %s\n' "$recipient" "${uid:-(key not in keyring)}"
 		fi
 	done < <(git config --get-all --local transcrypt.gpg-recipient 2>/dev/null || true)
 	printf '\nTo initialize a cloned repository, import the recipient keys into your\n'

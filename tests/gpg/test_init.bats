@@ -17,11 +17,41 @@ load "$BATS_TEST_DIRNAME/_gpg_helper.bash"
   [ "$status" -ne 0 ]
 }
 
-@test "init: recipients are stored as multi-valued git config" {
+@test "init: recipients are stored normalized to full fingerprints" {
+  # init used email identifiers; stored config must be canonical fprs
   run git config --get-all --local transcrypt.gpg-recipient
   [ "$status" -eq 0 ]
-  [ "${lines[0]}" = "$ALICE" ]
-  [ "${lines[1]}" = "$BOB" ]
+  [ "${lines[0]}" = "$ALICE_FPR" ]
+  [ "${lines[1]}" = "$BOB_FPR" ]
+}
+
+@test "init: accepts key ids and fingerprints as recipients" {
+  uninstall_transcrypt
+  bob_keyid="${BOB_FPR: -16}"
+  run "$TRANSCRYPT" --format=gpg \
+    --gpg-recipient="$ALICE_FPR" --gpg-recipient="$bob_keyid" --yes
+  [ "$status" -eq 0 ]
+
+  run git config --get-all --local transcrypt.gpg-recipient
+  [ "${lines[0]}" = "$ALICE_FPR" ]
+  [ "${lines[1]}" = "$BOB_FPR" ]
+}
+
+@test "init: missing recipients on repo with ciphertext lists key ids" {
+  encrypt_named_file sensitive_file "my secret"
+  uninstall_transcrypt
+  # simulate a fresh clone: no filters configured, working tree holds the
+  # committed ciphertext (uninstall left decrypted files, so restore)
+  git reset --hard --quiet
+
+  run "$TRANSCRYPT" --format=gpg --yes
+  [ "$status" -ne 0 ]
+  [[ "$output" = *"encrypted to"* ]]
+  # hint must include the keyid of at least one existing recipient
+  keyid=$(git show HEAD:sensitive_file |
+    gpg --list-packets --list-only 2>/dev/null |
+    sed -n 's/.*keyid \([0-9A-F]*\).*/\1/p' | head -1)
+  [[ "$output" = *"$keyid"* ]]
 }
 
 @test "init: gpg format recorded in local git config, no settings file" {

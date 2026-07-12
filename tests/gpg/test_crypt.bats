@@ -76,13 +76,9 @@ PGP_HEADER="-----BEGIN PGP MESSAGE-----"
 
 @test "crypt: smudge falls back to ciphertext when no key can decrypt" {
   encrypt_named_file sensitive_file "$SECRET_CONTENT"
-  # short path: gpg sockets break on deep BATS tmpdir paths (macOS limit)
-  emptyhome=$(mktemp -d /tmp/tc-empty.XXXXXX)
-  chmod 700 "$emptyhome"
+  emptyhome=$(make_empty_gnupghome)
   run bash -c "git show HEAD:sensitive_file --no-textconv |
     GNUPGHOME='$emptyhome' $TRANSCRYPT smudge context=default"
-  GNUPGHOME="$emptyhome" gpgconf --kill all 2>/dev/null || true
-  rm -rf "$emptyhome"
   [ "$status" -eq 0 ]
   [ "${lines[0]}" = "$PGP_HEADER" ]
 }
@@ -110,12 +106,32 @@ PGP_HEADER="-----BEGIN PGP MESSAGE-----"
   # plaintext unchanged after rekey
   run cat sensitive_file
   [ "${lines[0]}" = "$SECRET_CONTENT" ]
+
+  # the manually added email was normalized to a fingerprint by rekey
+  run git config --get-all --local transcrypt.gpg-recipient
+  [ "${lines[0]}" = "$ALICE_FPR" ]
+  [ "${lines[1]}" = "$BOB_FPR" ]
+  [ "${lines[2]}" = "$CHARLIE_FPR" ]
+}
+
+@test "crypt: clean without a secret key re-encrypts and warns" {
+  encrypt_named_file sensitive_file "$SECRET_CONTENT"
+
+  pubhome=$(make_pubkey_only_home)
+  git config --local transcrypt.gnupghome "$pubhome"
+
+  # no secret key: unchanged-detection is impossible; add must still
+  # succeed (pubkeys suffice to encrypt) but say why the blob churns
+  touch sensitive_file
+  run git add sensitive_file
+  [ "$status" -eq 0 ]
+  [[ "$output" = *"re-encrypting"* ]]
 }
 
 @test "crypt: rekey drops removed recipient" {
   encrypt_named_file sensitive_file "$SECRET_CONTENT"
 
-  git config --unset transcrypt.gpg-recipient "$BOB"
+  git config --unset transcrypt.gpg-recipient "$BOB_FPR"
   run $TRANSCRYPT --rekey --yes
   [ "$status" -eq 0 ]
 

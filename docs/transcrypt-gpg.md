@@ -10,23 +10,35 @@ PGP-armored ciphertext.
 ```sh
 cd <your-repo>
 transcrypt --format=gpg \
-  --gpg-recipient=you@example.com \
-  --gpg-recipient=teammate@example.com --yes
+  --gpg-recipient=662E63E410C1AF41 \
+  --gpg-recipient=1A6B4E9FC96C1D2B --yes
 
 transcrypt --add '*.secret'   # or edit .gitattributes directly
 git add .gitattributes your.secret
 git commit -m 'Add encrypted secret'
 ```
 
-A fresh clone needs the recipient public keys in the gpg keyring, then:
+`--gpg-recipient` accepts anything gpg can resolve to exactly one key:
+a key id, a full fingerprint, or an email address. Whatever you pass,
+transcrypt stores the key's full fingerprint in git config; ambiguous
+identifiers (an email matching two keys) are rejected.
+
+A fresh clone needs the recipient public keys in the gpg keyring, then
+the same configure command with the recipients again (recipient config
+is clone-local, not committed):
 
 ```sh
-transcrypt --format=gpg --yes
+transcrypt --format=gpg --gpg-recipient=<keyid> ... --yes
 ```
 
-Decrypting requires a private key for any one recipient; encrypting
-(and therefore `git add`) requires one too, because the clean filter
-decrypts the committed version to detect changes.
+Forgot who the recipients are? Run it without `--gpg-recipient` and the
+error lists the key ids the existing files are encrypted to.
+
+Decrypting requires a private key for any one recipient. Encrypting
+needs only public keys, but the clean filter decrypts the committed
+version to detect changes; on a machine with no secret key, `git add`
+still works but re-encrypts the file every time (a warning explains
+this), so expect noisy diffs there.
 
 ## Configuration
 
@@ -37,16 +49,21 @@ is self-describing, so clones need no committed crypto parameters.
 | Setting | Meaning |
 |---|---|
 | `transcrypt.format` | `gpg` selects this format |
-| `transcrypt.gpg-recipient` | multi-valued; one entry per recipient key |
+| `transcrypt.gpg-recipient` | multi-valued; one full key fingerprint per entry |
 | `transcrypt.gnupghome` | optional alternate `GNUPGHOME` for all gpg calls |
 
 Manage recipients with git config, then rekey:
 
 ```sh
-git config --add transcrypt.gpg-recipient new@example.com
-git config --unset transcrypt.gpg-recipient old@example.com
+git config --add transcrypt.gpg-recipient 3E5C4D8F662E63E410C1AF41...
+git config --unset transcrypt.gpg-recipient <old-fingerprint>
 transcrypt --rekey --yes
 ```
+
+Any gpg identifier works in `--add` (rekey normalizes entries to full
+fingerprints), but `--unset` matches the stored value, so pass the
+fingerprint shown by `git config --get-all transcrypt.gpg-recipient`
+or `transcrypt --display`.
 
 ## How the clean filter stays stable
 
