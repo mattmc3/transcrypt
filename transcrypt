@@ -291,7 +291,7 @@ hex_to_bin() {
 #
 # Formats known to auto-detection (pre-commit checks on unconfigured
 # repositories accept any of these):
-readonly CRYPT_BACKENDS='openssl gpg'
+readonly CRYPT_BACKENDS='openssl gpg pbkdf2'
 
 # the format in effect for this invocation; filters set it from their
 # format=NAME argument, cold paths from config or the --format flag
@@ -424,6 +424,129 @@ crypt_openssl_flush_credentials() { :; }
 crypt_openssl_upgrade_creds() { :; }
 crypt_openssl_export_creds() { :; }
 crypt_openssl_import_creds() { :; }
+
+##### PBKDF2 BACKEND
+#
+# The openssl format with a modern key derivation: `openssl enc -pbkdf2
+# -iter N -md sha512` instead of the legacy single-round EVP_BytesToKey.
+# The per-file salt stays deterministic (HMAC over the plaintext) so
+# unchanged files re-encrypt to identical ciphertext, with a per-project
+# base-salt mixed into the HMAC key so identical files in different
+# projects do not share ciphertext.
+#
+# Parameters live in local git config like every other format's
+# settings: decryption reads each file's salt from the Salted__ header,
+# so only iterations (and the password) are needed to decrypt, and both
+# travel out-of-band via the --display onboarding command.
+
+readonly DEFAULT_PBKDF2_ITERATIONS='310000'
+
+crypt_pbkdf2_is_ciphertext() {
+	crypt_openssl_is_ciphertext "$1"
+}
+
+crypt_pbkdf2_validate_blob() {
+	crypt_openssl_validate_blob
+}
+
+# load the pbkdf2 settings for the active context into globals
+load_pbkdf2_settings() {
+	context_config_group=$(derive_context_config_group "$context")
+	cipher=$(git config --get --local "transcrypt${context_config_group}.cipher")
+	password=$(load_password "$context_config_group")
+	iterations=$(git config --get --local "transcrypt${context_config_group}.iterations")
+	base_salt=$(git config --get --local "transcrypt${context_config_group}.base-salt")
+	openssl_path=$(git config --get --local transcrypt.openssl-path)
+}
+
+crypt_pbkdf2_clean() {
+	local filename=$1 tempfile=$2
+	if crypt_pbkdf2_is_ciphertext "$tempfile"; then
+		cat "$tempfile"
+		return
+	fi
+	load_pbkdf2_settings
+	salt=$("${openssl_path}" dgst -hmac "${filename}:${password}:${base_salt}" -sha256 "$tempfile" | tr -d '\r\n' | tail -c16)
+
+	if [ "$(is_salt_prefix_workaround_required)" == "true" ]; then
+		# Encrypt the file to base64, ensuring it includes the prefix 'Salted__' with the salt. #133
+		(
+			echo -n "Salted__" && echo -n "$salt" | hex_to_bin &&
+				ENC_PASS=$password "$openssl_path" enc -e "-${cipher}" -pbkdf2 -iter "$iterations" -md sha512 -pass env:ENC_PASS -S "$salt" -in "$tempfile"
+		) |
+			openssl base64
+	else
+		ENC_PASS=$password "$openssl_path" enc -e -a "-${cipher}" -pbkdf2 -iter "$iterations" -md sha512 -pass env:ENC_PASS -S "$salt" -in "$tempfile"
+	fi
+}
+
+crypt_pbkdf2_smudge() {
+	local tempfile=$1
+	load_pbkdf2_settings
+	ENC_PASS=$password "$openssl_path" enc -d "-${cipher}" -pbkdf2 -iter "$iterations" -md sha512 -pass env:ENC_PASS -a -in "$tempfile" 2>/dev/null || cat "$tempfile"
+}
+
+crypt_pbkdf2_textconv() {
+	local filename=$1
+	load_pbkdf2_settings
+	ENC_PASS=$password "$openssl_path" enc -d "-${cipher}" -pbkdf2 -iter "$iterations" -md sha512 -pass env:ENC_PASS -a -in "$filename" 2>/dev/null || cat "$filename"
+}
+
+crypt_pbkdf2_configure() {
+	get_cipher
+	get_password
+	# keep configured values on rekey/reconfigure unless flags override
+	if [[ $iterations_flag ]]; then
+		iterations=$iterations_flag
+	else
+		iterations=$(git config --get --local "transcrypt${CONTEXT_CONFIG_GROUP}.iterations" 2>/dev/null ||
+			echo "$DEFAULT_PBKDF2_ITERATIONS")
+	fi
+	[[ $iterations != *[!0-9]* ]] || die 1 'iterations must be a positive number: %s' "$iterations"
+	if [[ $base_salt_flag ]]; then
+		base_salt=$base_salt_flag
+	else
+		base_salt=$(git config --get --local "transcrypt${CONTEXT_CONFIG_GROUP}.base-salt" 2>/dev/null ||
+			"$openssl_path" rand -hex 16)
+	fi
+}
+
+crypt_pbkdf2_confirm() {
+	printf '  FORMAT:     pbkdf2\n'
+	printf '  CIPHER:     %s\n' "$cipher"
+	printf '  PASSWORD:   %s\n' "$password"
+	printf '  ITERATIONS: %s\n' "$iterations"
+	printf '  BASE-SALT:  %s\n\n' "$base_salt"
+}
+
+crypt_pbkdf2_save_config() {
+	git config "transcrypt${CONTEXT_CONFIG_GROUP}.cipher" "$cipher"
+	save_password "$password" "$CONTEXT_CONFIG_GROUP"
+	git config "transcrypt${CONTEXT_CONFIG_GROUP}.iterations" "$iterations"
+	git config "transcrypt${CONTEXT_CONFIG_GROUP}.base-salt" "$base_salt"
+	git config transcrypt.openssl-path "$openssl_path"
+}
+
+crypt_pbkdf2_display() {
+	local current_cipher current_password current_iterations current_base_salt escaped_password
+	current_cipher=$(git config --get --local "transcrypt${CONTEXT_CONFIG_GROUP}.cipher")
+	current_password=$(load_password "$CONTEXT_CONFIG_GROUP")
+	current_iterations=$(git config --get --local "transcrypt${CONTEXT_CONFIG_GROUP}.iterations")
+	current_base_salt=$(git config --get --local "transcrypt${CONTEXT_CONFIG_GROUP}.base-salt")
+	escaped_password=${current_password//\'/\'\\\'\'}
+
+	printf '  FORMAT:     pbkdf2\n'
+	printf '  CIPHER:     %s\n' "$current_cipher"
+	printf '  PASSWORD:   %s\n' "$current_password"
+	printf '  ITERATIONS: %s\n' "$current_iterations"
+	printf '  BASE-SALT:  %s\n\n' "$current_base_salt"
+	printf "Copy and paste the following command to initialize a cloned repository%s:\n\n" "$CONTEXT_DESCRIPTION"
+	printf "  transcrypt --format=pbkdf2 -c %s -p '%s' --iterations=%s --base-salt=%s\n" \
+		"$current_cipher" "$escaped_password" "$current_iterations" "$current_base_salt"
+}
+
+# password-credential operations that work unchanged for this format
+crypt_pbkdf2_flush_credentials() { :; }
 
 ##### GPG BACKEND
 #
@@ -1829,7 +1952,16 @@ help() {
 
 		     --format=FORMAT
 		            encryption format: 'openssl' (OpenSSL symmetric cipher,
-		            the default) or 'gpg' (encrypt to gpg recipient public keys)
+		            the default), 'pbkdf2' (openssl with modern PBKDF2 key
+		            derivation), or 'gpg' (encrypt to gpg recipient public keys)
+
+		     --iterations=N
+		            PBKDF2 iteration count; defaults to 310000.
+		            Requires --format=pbkdf2
+
+		     --base-salt=HEX
+		            per-project salt component; generated randomly when
+		            omitted. Requires --format=pbkdf2
 
 		     --gpg-recipient=KEYID
 		            gpg key to encrypt to; repeat for multiple recipients.
@@ -1982,11 +2114,13 @@ help() {
 
 # reset all variables that might be set
 context=''
+base_salt_flag=''
 check_files=''
 cipher=''
 display_config=''
 add_pattern=''
 format_flag=''
+iterations_flag=''
 list_contexts_command=''
 flush_creds=''
 gpg_import_file=''
@@ -2086,6 +2220,24 @@ while [[ "${1:-}" != '' ]]; do
 	--gpg-recipient=*)
 		[[ ${1#*=} ]] || die 1 'empty gpg recipient'
 		gpg_recipients+=("${1#*=}")
+		;;
+	--iterations)
+		iterations_flag=${2:-}
+		[[ $iterations_flag ]] || die 1 'empty iterations'
+		shift
+		;;
+	--iterations=*)
+		iterations_flag=${1#*=}
+		[[ $iterations_flag ]] || die 1 'empty iterations'
+		;;
+	--base-salt)
+		base_salt_flag=${2:-}
+		[[ $base_salt_flag ]] || die 1 'empty base-salt'
+		shift
+		;;
+	--base-salt=*)
+		base_salt_flag=${1#*=}
+		[[ $base_salt_flag ]] || die 1 'empty base-salt'
 		;;
 	--check)
 		check_files='true'
@@ -2212,7 +2364,7 @@ if [[ $format_flag ]]; then
 	FORMAT=$format_flag
 fi
 case $FORMAT in
-openssl | gpg) ;;
+openssl | gpg | pbkdf2) ;;
 legacy)
 	# accepted as input for the openssl format, never stored
 	FORMAT='openssl'

@@ -27,11 +27,19 @@ the password to derive the key from; defaults to 30 random base64 characters
 .
 .TP
 \fB\-\-format\fR=\fIformat\fR
-encryption format: \'openssl\' (OpenSSL symmetric cipher, the default) or \'gpg\' (encrypt to gpg recipient public keys)
+encryption format: \'openssl\' (OpenSSL symmetric cipher, the default), \'pbkdf2\' (openssl with modern PBKDF2 key derivation), or \'gpg\' (encrypt to gpg recipient public keys)
 .
 .TP
 \fB\-\-gpg\-recipient\fR=\fIkeyid\fR
 gpg key to encrypt to; repeat for multiple recipients\. Requires \-\-format=gpg\. Keys must be in the gpg keyring (set transcrypt\.gnupghome to use an alternate keyring)
+.
+.TP
+\fB\-\-iterations\fR=\fIn\fR
+PBKDF2 iteration count; defaults to 310000\. Requires \-\-format=pbkdf2
+.
+.TP
+\fB\-\-base\-salt\fR=\fIhex\fR
+per\-project salt component; generated randomly when omitted\. Requires \-\-format=pbkdf2
 .
 .TP
 \fB\-\-check\fR

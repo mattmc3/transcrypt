@@ -222,12 +222,21 @@ directory.
 
       --format=FORMAT
              encryption format: 'openssl' (OpenSSL symmetric cipher, the
-             default) or 'gpg' (encrypt to gpg recipient public keys)
+             default), 'pbkdf2' (openssl with modern PBKDF2 key
+             derivation), or 'gpg' (encrypt to gpg recipient public keys)
 
       --gpg-recipient=KEYID
              gpg key to encrypt to; repeat for multiple recipients.
              Requires --format=gpg. Keys must be in the gpg keyring
              (set transcrypt.gnupghome to use an alternate keyring)
+
+      --iterations=N
+             PBKDF2 iteration count; defaults to 310000.
+             Requires --format=pbkdf2
+
+      --base-salt=HEX
+             per-project salt component; generated randomly when
+             omitted. Requires --format=pbkdf2
 
       --check
              verify that every encrypted file in the index is valid
