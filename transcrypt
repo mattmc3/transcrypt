@@ -739,6 +739,19 @@ crypt_gpg_configure() {
 	local resolved=()
 	local recipient fpr
 
+	# collect recipients interactively when none were given and none are
+	# configured yet
+	if [[ ${#gpg_recipients[@]} -eq 0 ]] && [[ $interactive ]] && [[ ! "$(load_gpg_recipients)" ]]; then
+		local answer
+		printf 'The gpg format encrypts to one or more recipient keys.\n'
+		while true; do
+			printf 'Add recipient (key id, fingerprint, or email; empty to finish): '
+			read -r answer
+			[[ $answer ]] || break
+			gpg_recipients+=("$answer")
+		done
+	fi
+
 	if [[ ${#gpg_recipients[@]} -gt 0 ]]; then
 		for recipient in "${gpg_recipients[@]}"; do
 			fpr=$(resolve_gpg_recipient "$recipient") || exit $?
@@ -2357,25 +2370,46 @@ set_context_globals
 
 gather_repo_metadata
 
+# normalize and check FORMAT against the registered backends
+validate_format() {
+	if [[ $FORMAT == 'legacy' ]]; then
+		# accepted as input for the openssl format, never stored
+		FORMAT='openssl'
+		return 0
+	fi
+	# shellcheck disable=SC2086
+	is_item_in_array "$FORMAT" $CRYPT_BACKENDS ||
+		die 1 'unsupported format: %s (known formats: %s)' "$FORMAT" "$CRYPT_BACKENDS"
+	if [[ $FORMAT == 'gpg' ]] && [[ $CONTEXT != 'default' ]]; then
+		die 1 'contexts are not supported with the gpg format'
+	fi
+}
+
+# ask which format to configure, when it is not already decided by a
+# flag, an existing configuration, or a rekey of one
+get_format() {
+	if [[ $format_flag ]] || [[ ! $interactive ]] || [[ $rekey ]]; then
+		return 0
+	fi
+	if [[ ${CONFIGURED_CONTEXTS:-} ]]; then
+		return 0
+	fi
+	local answer=
+	printf 'Encrypt using which format? [openssl] (%s) ' "${CRYPT_BACKENDS// /, }"
+	read -r answer
+	if [[ $answer ]]; then
+		FORMAT=$answer
+		validate_format
+	fi
+}
+
 # resolve the format for non-filter operations: an explicit --format
 # flag wins, else any configured format, defaulting to openssl
 FORMAT=$(git config --get --local transcrypt.format 2>/dev/null || echo 'openssl')
 if [[ $format_flag ]]; then
 	FORMAT=$format_flag
 fi
-case $FORMAT in
-openssl | gpg | pbkdf2) ;;
-legacy)
-	# accepted as input for the openssl format, never stored
-	FORMAT='openssl'
-	;;
-*)
-	die 1 'unsupported format: %s' "$FORMAT"
-	;;
-esac
-if [[ $FORMAT == 'gpg' ]] && [[ $CONTEXT != 'default' ]]; then
-	die 1 'contexts are not supported with the gpg format'
-fi
+validate_format
 
 # always run our safety checks
 run_safety_checks
@@ -2436,6 +2470,7 @@ count_dirty_files() {
 readonly GIT_DIRTY_FILES_BEFORE_INIT="$(count_dirty_files)"
 
 # perform function calls to configure transcrypt
+get_format
 crypt_call configure
 
 if [[ $rekey ]] && [[ $interactive ]]; then
