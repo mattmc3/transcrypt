@@ -1,3 +1,9 @@
+# Isolate tests from the developer's global and system git config, so
+# settings like merge.conflictstyle or commit.gpgsign cannot change test
+# behavior. Requires Git 2.32+.
+export GIT_CONFIG_GLOBAL=/dev/null
+export GIT_CONFIG_SYSTEM=/dev/null
+
 function init_git_repo {
   # Warn and do nothing if test dir envvar is unset
   if [[ -z "$BATS_TEST_DIRNAME" ]]; then

@@ -68,7 +68,7 @@ PGP_HEADER="-----BEGIN PGP MESSAGE-----"
 @test "crypt: clean passes already-encrypted input through unchanged" {
   encrypt_named_file sensitive_file "$SECRET_CONTENT"
   git show HEAD:sensitive_file --no-textconv > /tmp/ciphertext.$$
-  run bash -c "../../transcrypt clean context=default sensitive_file < /tmp/ciphertext.$$"
+  run bash -c "$TRANSCRYPT clean context=default sensitive_file < /tmp/ciphertext.$$"
   rm -f /tmp/ciphertext.$$
   [ "$status" -eq 0 ]
   [ "${lines[0]}" = "$PGP_HEADER" ]
@@ -76,11 +76,13 @@ PGP_HEADER="-----BEGIN PGP MESSAGE-----"
 
 @test "crypt: smudge falls back to ciphertext when no key can decrypt" {
   encrypt_named_file sensitive_file "$SECRET_CONTENT"
-  emptyhome="$BATS_TEST_TMPDIR/empty-gnupg"
-  mkdir -p "$emptyhome"
+  # short path: gpg sockets break on deep BATS tmpdir paths (macOS limit)
+  emptyhome=$(mktemp -d /tmp/tc-empty.XXXXXX)
   chmod 700 "$emptyhome"
   run bash -c "git show HEAD:sensitive_file --no-textconv |
-    GNUPGHOME='$emptyhome' ../../transcrypt smudge context=default"
+    GNUPGHOME='$emptyhome' $TRANSCRYPT smudge context=default"
+  GNUPGHOME="$emptyhome" gpgconf --kill all 2>/dev/null || true
+  rm -rf "$emptyhome"
   [ "$status" -eq 0 ]
   [ "${lines[0]}" = "$PGP_HEADER" ]
 }
@@ -99,7 +101,7 @@ PGP_HEADER="-----BEGIN PGP MESSAGE-----"
   encrypt_named_file sensitive_file "$SECRET_CONTENT"
 
   git config --add transcrypt.gpg-recipient "$CHARLIE"
-  run ../../transcrypt --rekey --yes
+  run $TRANSCRYPT --rekey --yes
   [ "$status" -eq 0 ]
 
   count=$(git show :0:sensitive_file --no-textconv | recipient_count)
@@ -114,7 +116,7 @@ PGP_HEADER="-----BEGIN PGP MESSAGE-----"
   encrypt_named_file sensitive_file "$SECRET_CONTENT"
 
   git config --unset transcrypt.gpg-recipient "$BOB"
-  run ../../transcrypt --rekey --yes
+  run $TRANSCRYPT --rekey --yes
   [ "$status" -eq 0 ]
 
   count=$(git show :0:sensitive_file --no-textconv | recipient_count)

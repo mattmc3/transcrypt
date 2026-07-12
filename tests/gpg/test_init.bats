@@ -34,7 +34,7 @@ load "$BATS_TEST_DIRNAME/_gpg_helper.bash"
 }
 
 @test "init: display shows gpg format and recipients" {
-  run ../../transcrypt --display
+  run $TRANSCRYPT --display
   [ "$status" -eq 0 ]
   [[ "$output" = *"FORMAT:   gpg"* ]]
   [[ "$output" = *"$ALICE"* ]]
@@ -43,21 +43,21 @@ load "$BATS_TEST_DIRNAME/_gpg_helper.bash"
 
 @test "init: gpg format without recipients fails" {
   uninstall_transcrypt
-  run ../../transcrypt --format=gpg --yes
+  run $TRANSCRYPT --format=gpg --yes
   [ "$status" -ne 0 ]
   [[ "$output" = *"recipient"* ]]
 }
 
 @test "init: unknown recipient fails" {
   uninstall_transcrypt
-  run ../../transcrypt --format=gpg --gpg-recipient=nobody@example.com --yes
+  run $TRANSCRYPT --format=gpg --gpg-recipient=nobody@example.com --yes
   [ "$status" -ne 0 ]
 }
 
 @test "init: uninstall leaves decrypted file in working copy" {
   encrypt_named_file sensitive_file "my secret"
 
-  run ../../transcrypt --uninstall --yes
+  run $TRANSCRYPT --uninstall --yes
   [ "$status" -eq 0 ]
 
   run cat sensitive_file
