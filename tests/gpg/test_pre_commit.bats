@@ -17,6 +17,44 @@ load "$BATS_TEST_DIRNAME/_gpg_helper.bash"
   [ "$status" -eq 0 ]
 }
 
+@test "pre-commit: reject commit of hand-corrupted ciphertext" {
+  echo "Secret stuff" > sensitive_file
+  encrypt_named_file sensitive_file
+
+  # simulate a hand-edit: header intact, one body byte changed (breaks
+  # the armor CRC), staged without the clean filter as a raw editor would
+  git show HEAD:sensitive_file |
+    awk 'NR==3 {c=substr($0,1,1); $0=(c=="A"?"B":"A") substr($0,2)} {print}' > sensitive_file
+  echo "" > .gitattributes
+  git add sensitive_file
+  echo "sensitive_file filter=crypt diff=crypt merge=crypt" > .gitattributes
+
+  run git commit -m "corrupted"
+  [ "$status" -ne 0 ]
+  [[ "$output" = *"not valid"* ]]
+}
+
+@test "check: --check passes a healthy repo and fails a corrupted one" {
+  echo "Secret stuff" > sensitive_file
+  encrypt_named_file sensitive_file
+
+  run $TRANSCRYPT --check
+  [ "$status" -eq 0 ]
+
+  # commit a corrupted blob, bypassing the clean filter and the hook,
+  # the way a collaborator without transcrypt configured would
+  git show HEAD:sensitive_file |
+    awk 'NR==3 {c=substr($0,1,1); $0=(c=="A"?"B":"A") substr($0,2)} {print}' > sensitive_file
+  echo "" > .gitattributes
+  git add sensitive_file
+  git commit -m "corrupted" --no-verify
+  echo "sensitive_file filter=crypt diff=crypt merge=crypt" > .gitattributes
+
+  run $TRANSCRYPT --check
+  [ "$status" -ne 0 ]
+  [[ "$output" = *"sensitive_file"* ]]
+}
+
 @test "pre-commit: reject commit of encrypted file with unencrypted content" {
   echo "Secret stuff" > sensitive_file
   encrypt_named_file sensitive_file

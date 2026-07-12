@@ -627,14 +627,44 @@ git_merge() {
 
 # shellcheck disable=SC2155
 git_pre_commit() {
-	# Transcrypt pre-commit hook: fail if secret file in staging lacks the magic prefix "Salted" in B64
+	# Transcrypt pre-commit hook: fail if a secret file staged in the index
+	# is not valid ciphertext for the repository's format
 	tmp=$(mktemp)
 	IFS=$'\n'
-	# the gpg format armors ciphertext with a PGP header instead
-	expected_prefix='U2FsdGVk'
+	# Which ciphertext to expect. Unconfigured repos (--check in CI) accept
+	# either format but still structurally validate PGP blobs.
+	local mode='auto'
 	if is_gpg_format; then
-		expected_prefix='-----BEG'
+		mode='gpg'
+	elif [[ $(git config --get --local transcrypt.version 2>/dev/null || true) ]]; then
+		mode='legacy'
 	fi
+
+	# true (0) when the staged blob for $1 is not acceptable ciphertext.
+	# PGP armor carries a CRC, so `gpg --list-packets` detects hand-edited
+	# or corrupted ciphertext without needing any key.
+	staged_blob_bad() {
+		local f=$1 firstbytes
+		firstbytes=$(git show :"$f" | head -c8)
+		case $firstbytes in
+		'')
+			return 1 # An empty file does not need to be, and is not, encrypted
+			;;
+		'U2FsdGVk')
+			[[ $mode == 'gpg' ]]
+			;;
+		'-----BEG')
+			if [[ $mode == 'legacy' ]]; then
+				return 0
+			fi
+			! git show :"$f" | gpg_cmd --batch --list-packets --list-only >/dev/null 2>&1
+			;;
+		*)
+			return 0
+			;;
+		esac
+	}
+
 	slow_mode_if_failed() {
 		for secret_file in $(_list_encrypted_files); do
 			# Skip symlinks, they contain the linked target file path not plaintext
@@ -644,11 +674,19 @@ git_pre_commit() {
 
 			# Get prefix of raw file in Git's index using the :FILENAME revision syntax
 			local firstbytes=$(git show :"${secret_file}" | head -c8)
-			# An empty file does not need to be, and is not, encrypted
-			if [[ $firstbytes == "" ]]; then
+			if ! staged_blob_bad "$secret_file"; then
 				: # Do nothing
-			# The first bytes of an encrypted file must be "Salted" in Base64
-			elif [[ $firstbytes != "$expected_prefix" ]]; then
+			elif [[ $firstbytes == '-----BEG' && $mode != 'legacy' ]]; then
+				printf 'Transcrypt managed file is not valid ciphertext in the Git index: %s\n' "$secret_file" >&2
+				printf '\n' >&2
+				printf 'The file was probably edited or corrupted while encrypted. Restore it\n' >&2
+				printf 'from a known-good commit, or re-stage the real plaintext:\n' >&2
+				printf '\n' >&2
+				printf '    git rm --cached -- %s\n' "$secret_file" >&2
+				printf '    git add %s\n' "$secret_file" >&2
+				printf '\n' >&2
+				exit 1
+			else
 				printf 'Transcrypt managed file is not encrypted in the Git index: %s\n' "$secret_file" >&2
 				printf '\n' >&2
 				printf 'You probably staged this file using a tool that does not apply' >&2
@@ -672,12 +710,7 @@ git_pre_commit() {
 		if [[ -L $secret_file ]]; then
 			return
 		fi
-		# Get prefix of raw file in Git's index using the :FILENAME revision syntax
-		# The first bytes of an encrypted file are always "Salted" in Base64
-		local firstbytes=$(git show :"${secret_file}" | head -c8)
-		if [[ $firstbytes == "" ]]; then
-			: # Do nothing
-		elif [[ $firstbytes != "$expected_prefix" ]]; then
+		if staged_blob_bad "$secret_file"; then
 			echo "true" >>"${tmp}"
 		fi
 	}
@@ -1667,6 +1700,11 @@ help() {
 		            list all of the transparently encrypted files in the repository,
 		            relative to the top-level directory
 
+		     --check
+		            verify that every encrypted file in the index is valid
+		            ciphertext; works without any configuration or keys, for
+		            use in CI to catch corrupted or plaintext-staged secrets
+
 		     -s, --show-raw=FILE
 		            show  the  raw file as stored in the git commit object; use this
 		            to check if files are encrypted as expected
@@ -1773,6 +1811,7 @@ help() {
 
 # reset all variables that might be set
 context=''
+check_files=''
 cipher=''
 display_config=''
 add_pattern=''
@@ -1915,6 +1954,10 @@ while [[ "${1:-}" != '' ]]; do
 		list='true'
 		requires_clean_repo=''
 		;;
+	--check)
+		check_files='true'
+		requires_clean_repo=''
+		;;
 	--list-contexts)
 		list_contexts_command='true'
 		requires_clean_repo=''
@@ -2001,6 +2044,11 @@ readonly YES_REGEX='^[Yy]$'
 # specified in, we must run these here rather than in the case statement above
 if [[ $list ]]; then
 	list_files
+	exit 0
+elif [[ $check_files ]]; then
+	cd "$REPO" >/dev/null || die 1 'could not change into the "%s" directory' "$REPO"
+	git_pre_commit
+	printf 'All encrypted files in the index are valid ciphertext.\n'
 	exit 0
 elif [[ $uninstall ]]; then
 	uninstall_transcrypt
