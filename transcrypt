@@ -291,7 +291,7 @@ hex_to_bin() {
 #
 # Formats known to auto-detection (pre-commit checks on unconfigured
 # repositories accept any of these):
-readonly CRYPT_BACKENDS='openssl'
+readonly CRYPT_BACKENDS='openssl gpg'
 
 # the format in effect for this invocation; filters set it from their
 # format=NAME argument, cold paths from config or the --format flag
@@ -424,6 +424,324 @@ crypt_openssl_flush_credentials() { :; }
 crypt_openssl_upgrade_creds() { :; }
 crypt_openssl_export_creds() { :; }
 crypt_openssl_import_creds() { :; }
+
+##### GPG BACKEND
+#
+# Encrypts to the public keys of one or more gpg recipients instead of
+# deriving a symmetric key from a shared password. GPG output is not
+# deterministic (random session key and prefix), so the clean filter
+# stays idempotent a different way: it reuses the ciphertext already
+# staged in the index whenever that ciphertext decrypts to exactly the
+# incoming plaintext, and only encrypts afresh on a real content change.
+#
+# Recipients live in local git config as full fingerprints; the private
+# key in the gpg keyring is the only credential, so there is nothing to
+# flush, export, or import, and those operations are refused.
+
+# run gpg, honoring an alternate keyring set via transcrypt.gnupghome.
+# The config value is read once per process; filters call this several
+# times per file
+gpg_cmd() {
+	if [[ -z "${GPG_GNUPGHOME_LOADED:-}" ]]; then
+		GPG_GNUPGHOME=$(git config --get --local transcrypt.gnupghome 2>/dev/null || true)
+		GPG_GNUPGHOME_LOADED='true'
+	fi
+	if [[ $GPG_GNUPGHOME ]]; then
+		GNUPGHOME=$GPG_GNUPGHOME gpg "$@"
+	else
+		gpg "$@"
+	fi
+}
+
+# print the configured recipient fingerprints, one per line
+load_gpg_recipients() {
+	git config --get-all --local transcrypt.gpg-recipient 2>/dev/null || true
+}
+
+# replace the stored recipient list with the given fingerprints
+save_gpg_recipients() {
+	git config --unset-all transcrypt.gpg-recipient 2>/dev/null || true
+	local fpr
+	for fpr in "$@"; do
+		git config --add transcrypt.gpg-recipient "$fpr"
+	done
+}
+
+# decrypt the file named by $1 to stdout; quiet on failure
+gpg_decrypt_file() {
+	gpg_cmd --batch --quiet --decrypt -- "$1" 2>/dev/null
+}
+
+# encrypt the file named by $1 to stdout, for every configured recipient
+gpg_encrypt_file() {
+	local infile=$1
+	local recipient
+	local recipient_args=()
+	while IFS= read -r recipient; do
+		if [[ $recipient ]]; then
+			recipient_args+=(--recipient "$recipient")
+		fi
+	done < <(load_gpg_recipients)
+	if [[ ${#recipient_args[@]} -eq 0 ]]; then
+		die 1 'no gpg recipients configured; set transcrypt.gpg-recipient'
+	fi
+	if ! gpg_cmd --batch --quiet --yes --trust-model always --armor --encrypt \
+		"${recipient_args[@]}" --output - -- "$infile"; then
+		die 1 'gpg encryption failed; check the recipient keys with `gpg --list-keys` (an expired or revoked key cannot encrypt) and rekey after fixing them'
+	fi
+}
+
+# resolve a recipient identifier (email, key id, fingerprint) to the full
+# fingerprint of exactly one usable key in the keyring
+resolve_gpg_recipient() {
+	local ident=$1
+	local matches
+	# validity and primary-key fingerprint: the fpr line after each pub line
+	matches=$(gpg_cmd --list-keys --with-colons -- "$ident" 2>/dev/null |
+		awk -F: '$1 == "pub" {v=$2; p=1} p && $1 == "fpr" {print v ":" $10; p=0}')
+	[[ $matches ]] || die 1 'gpg recipient key "%s" was not found in the keyring' "$ident"
+	if [[ $matches == *$'\n'* ]]; then
+		die 1 'gpg recipient "%s" matches more than one key; use a fingerprint' "$ident"
+	fi
+	case ${matches%%:*} in
+	e | r | d | n)
+		die 1 'gpg recipient key "%s" is not usable (expired, revoked, or disabled)' "$ident"
+		;;
+	esac
+	printf '%s\n' "${matches#*:}"
+}
+
+# fail configuration, listing the key ids existing ciphertext is encrypted to
+die_gpg_no_recipients() {
+	local hint=''
+	if [[ $HEAD_EXISTS ]]; then
+		hint=$(
+			cd "$REPO" 2>/dev/null || exit 0
+			file=$(_list_encrypted_files | head -1)
+			[[ $file ]] || exit 0
+			git show HEAD:"$file" 2>/dev/null |
+				gpg_cmd --list-packets --list-only 2>/dev/null |
+				sed -n 's/.*keyid \([0-9A-Fa-f]*\).*/\1/p' | sort -u | tr '\n' ' '
+		)
+	fi
+	if [[ $hint ]]; then
+		warn 'existing files are encrypted to key ids: %s' "$hint"
+	fi
+	die 1 'the gpg format requires at least one recipient; use --gpg-recipient=KEYID'
+}
+
+crypt_gpg_is_ciphertext() {
+	# The `head + LC_ALL=C tr` command handles binary data in old and new Bash (#116)
+	[[ "$(head -c8 -- "$1" 2>/dev/null | LC_ALL=C tr -d '\0')" == '-----BEG' ]]
+}
+
+# PGP armor carries a CRC, so `gpg --list-packets` detects hand-edited or
+# corrupted ciphertext without needing any key
+crypt_gpg_validate_blob() {
+	gpg_cmd --batch --list-packets --list-only >/dev/null 2>&1
+}
+
+# a blob with an armor header that fails validation was corrupted, not
+# staged as plaintext; lets the pre-commit check say which happened
+crypt_gpg_blob_prefix_matches() {
+	[[ ${1:0:8} == '-----BEG' ]]
+}
+
+# clean for the gpg format: plaintext arrives on stdin cached in
+# tempfile $2, ciphertext for the file named $1 leaves on stdout.
+# oldfile is deliberately not local: the EXIT trap runs after this
+# function's scope is gone
+crypt_gpg_clean() {
+	local filename=$1 tempfile=$2
+	# already-encrypted input passes through untouched, except during a
+	# rekey: passing it through would silently keep the old recipients,
+	# so decrypt and re-encrypt it, or fail the rekey loudly
+	if crypt_gpg_is_ciphertext "$tempfile"; then
+		if [[ "${TRANSCRYPT_GPG_REKEY:-}" ]]; then
+			if gpg_decrypt_file "$tempfile" >"$tempfile.plain"; then
+				gpg_encrypt_file "$tempfile.plain"
+				return
+			fi
+			warn 'cannot rekey "%s": unable to decrypt it with the available keys' "$filename"
+			exit 1
+		fi
+		cat "$tempfile"
+		return
+	fi
+	# reuse the index ciphertext when it decrypts to the incoming plaintext,
+	# so unchanged files produce stable clean output; TRANSCRYPT_GPG_REKEY
+	# bypasses the reuse to force re-encryption with current recipients
+	oldfile=$(mktemp 2>/dev/null || mktemp -t tmp)
+	trap 'rm -f "$tempfile" "$tempfile.plain" "$oldfile" "$oldfile.plain"' EXIT
+	if [[ ! "${TRANSCRYPT_GPG_REKEY:-}" ]] &&
+		git cat-file blob ":0:$filename" >"$oldfile" 2>/dev/null &&
+		crypt_gpg_is_ciphertext "$oldfile"; then
+		if gpg_decrypt_file "$oldfile" >"$oldfile.plain"; then
+			if cmp -s -- "$oldfile.plain" "$tempfile"; then
+				cat "$oldfile"
+				return
+			fi
+		else
+			# encryption needs only public keys, but unchanged-detection
+			# needs a secret key; without one the blob churns on every add
+			warn 'cannot decrypt the committed "%s" to check for changes (missing secret key?); re-encrypting' "$filename"
+		fi
+	fi
+	gpg_encrypt_file "$tempfile"
+}
+
+crypt_gpg_smudge() {
+	gpg_decrypt_file "$1" || cat "$1"
+}
+
+crypt_gpg_textconv() {
+	gpg_decrypt_file "$1" || cat "$1"
+}
+
+# a merge side that is still armored after smudge could not be decrypted;
+# merging armor text and re-encrypting it as plaintext would destroy the
+# secret, so abort and leave the merge for a machine with a secret key
+crypt_gpg_merge_check_sides() {
+	local side
+	for side in "$1" "$2" "$3"; do
+		if crypt_gpg_is_ciphertext "$side"; then
+			warn 'cannot decrypt "%s" during merge (missing secret key?); aborting to avoid corrupting it' "$4"
+			exit 1
+		fi
+	done
+}
+
+crypt_gpg_configure() {
+	command -v gpg >/dev/null || die 'required command "gpg" was not found'
+	local resolved=()
+	local recipient fpr
+
+	if [[ ${#gpg_recipients[@]} -gt 0 ]]; then
+		for recipient in "${gpg_recipients[@]}"; do
+			fpr=$(resolve_gpg_recipient "$recipient") || exit $?
+			resolved+=("$fpr")
+		done
+		gpg_recipients=("${resolved[@]}")
+		return 0
+	fi
+
+	# none given: normalize whatever is already configured (eg: recipients
+	# added by hand with `git config --add` before a rekey)
+	local existing
+	existing=$(load_gpg_recipients)
+	[[ $existing ]] || die_gpg_no_recipients
+	local changed=''
+	while IFS= read -r recipient; do
+		[[ $recipient ]] || continue
+		fpr=$(resolve_gpg_recipient "$recipient") || exit $?
+		[[ $fpr == "$recipient" ]] || changed='true'
+		resolved+=("$fpr")
+	done <<<"$existing"
+	if [[ $changed ]]; then
+		save_gpg_recipients "${resolved[@]}"
+	fi
+}
+
+crypt_gpg_confirm() {
+	printf '  FORMAT:   gpg\n'
+	printf '  RECIPIENTS:\n'
+	local recipient
+	while IFS= read -r recipient; do
+		if [[ $recipient ]]; then
+			printf '    %s\n' "$recipient"
+		fi
+	done < <(
+		if [[ ${#gpg_recipients[@]} -gt 0 ]]; then
+			printf '%s\n' "${gpg_recipients[@]}"
+		else
+			load_gpg_recipients
+		fi
+	)
+	printf '\n'
+}
+
+crypt_gpg_save_config() {
+	# replace recipients only when new ones were given; a rekey with
+	# none given keeps the recipient list already in git config
+	if [[ ${#gpg_recipients[@]} -gt 0 ]]; then
+		save_gpg_recipients "${gpg_recipients[@]}"
+	fi
+}
+
+crypt_gpg_display() {
+	printf '  FORMAT:   gpg\n'
+	printf '  RECIPIENTS:\n'
+	local recipient uid
+	while IFS= read -r recipient; do
+		if [[ $recipient ]]; then
+			uid=$(gpg_cmd --list-keys --with-colons -- "$recipient" 2>/dev/null |
+				awk -F: '/^uid/ {print $10; exit}')
+			printf '    %s  %s\n' "$recipient" "${uid:-(key not in keyring)}"
+		fi
+	done < <(load_gpg_recipients)
+	printf '\nTo initialize a cloned repository, import the recipient keys into your\n'
+	printf 'gpg keyring and run:\n\n'
+	printf '  transcrypt --format=gpg --gpg-recipient=<keyid> ... --yes\n'
+}
+
+# force the clean filter to re-encrypt with the current recipients
+# instead of reusing index ciphertext during a rekey
+crypt_gpg_rekey_prepare() {
+	TRANSCRYPT_GPG_REKEY='true'
+	export TRANSCRYPT_GPG_REKEY
+}
+
+# secret files must round-trip byte-exact; -text keeps eol conversion
+# (core.autocrlf) away from armored ciphertext and restored plaintext
+crypt_gpg_extra_attrs() {
+	printf '%s' '-text'
+}
+
+# report the health of every configured recipient key; fails when any
+# key in the keyring is expired, revoked, or disabled. Keys absent from
+# the keyring are reported but tolerated (CI machines hold no keys).
+crypt_gpg_health() {
+	local now bad='' fpr keyinfo validity expires uid expiry_date
+	now=$(date +%s)
+	while IFS= read -r fpr; do
+		[[ $fpr ]] || continue
+		keyinfo=$(gpg_cmd --list-keys --with-colons -- "$fpr" 2>/dev/null || true)
+		# --with-colons always emits a tru: trustdb line; only a pub line
+		# means the key is actually present
+		if [[ $'\n'$keyinfo != *$'\n'pub:* ]]; then
+			printf 'recipient %s: not in this keyring (health unknown)\n' "$fpr"
+			continue
+		fi
+		# colon-delimited so empty fields survive (IFS whitespace would
+		# collapse them); gpg escapes colons inside uid strings
+		IFS=: read -r validity expires uid < <(echo "$keyinfo" |
+			awk -F: '$1 == "pub" && !p {v=$2; e=$7; p=1} $1 == "uid" && !u {u=$10} END {printf "%s:%s:%s\n", v, e, u}')
+		case $validity in
+		e)
+			printf 'recipient %s (%s): EXPIRED\n' "$fpr" "$uid"
+			bad='true'
+			;;
+		r)
+			printf 'recipient %s (%s): REVOKED\n' "$fpr" "$uid"
+			bad='true'
+			;;
+		d)
+			printf 'recipient %s (%s): DISABLED\n' "$fpr" "$uid"
+			bad='true'
+			;;
+		*)
+			if [[ $expires ]] && ((expires - now < 30 * 86400)); then
+				expiry_date=$(date -r "$expires" +%Y-%m-%d 2>/dev/null ||
+					date -d "@$expires" +%Y-%m-%d 2>/dev/null || echo "$expires")
+				printf 'recipient %s (%s): expires soon, on %s\n' "$fpr" "$uid" "$expiry_date"
+			fi
+			;;
+		esac
+	done < <(load_gpg_recipients)
+	if [[ $bad ]]; then
+		die 1 'unusable recipient keys found; renew or replace them (eg: `gpg --quick-set-expire <fpr> 2y`), then rekey'
+	fi
+}
 
 ##### GIT FILTERS
 
@@ -1509,6 +1827,14 @@ help() {
 		            the password to derive the key from;
 		            defaults to 30 random base64 characters
 
+		     --format=FORMAT
+		            encryption format: 'openssl' (OpenSSL symmetric cipher,
+		            the default) or 'gpg' (encrypt to gpg recipient public keys)
+
+		     --gpg-recipient=KEYID
+		            gpg key to encrypt to; repeat for multiple recipients.
+		            Requires --format=gpg. Keys must be in the gpg keyring
+		            (set transcrypt.gnupghome to use an alternate keyring)
 
 		     --check
 		            verify that every encrypted file in the index is valid
@@ -1660,10 +1986,12 @@ check_files=''
 cipher=''
 display_config=''
 add_pattern=''
+format_flag=''
 list_contexts_command=''
 flush_creds=''
 gpg_import_file=''
 gpg_recipient=''
+gpg_recipients=()
 interactive='true'
 list=''
 password=''
@@ -1740,6 +2068,24 @@ while [[ "${1:-}" != '' ]]; do
 		;;
 	--context=*)
 		context=${1#*=}
+		;;
+	--format)
+		format_flag=${2:-}
+		[[ $format_flag ]] || die 1 'empty format'
+		shift
+		;;
+	--format=*)
+		format_flag=${1#*=}
+		[[ $format_flag ]] || die 1 'empty format'
+		;;
+	--gpg-recipient)
+		[[ ${2:-} ]] || die 1 'empty gpg recipient'
+		gpg_recipients+=("$2")
+		shift
+		;;
+	--gpg-recipient=*)
+		[[ ${1#*=} ]] || die 1 'empty gpg recipient'
+		gpg_recipients+=("${1#*=}")
 		;;
 	--check)
 		check_files='true'
@@ -1862,8 +2208,11 @@ gather_repo_metadata
 # resolve the format for non-filter operations: an explicit --format
 # flag wins, else any configured format, defaulting to openssl
 FORMAT=$(git config --get --local transcrypt.format 2>/dev/null || echo 'openssl')
+if [[ $format_flag ]]; then
+	FORMAT=$format_flag
+fi
 case $FORMAT in
-openssl) ;;
+openssl | gpg) ;;
 legacy)
 	# accepted as input for the openssl format, never stored
 	FORMAT='openssl'
@@ -1872,6 +2221,9 @@ legacy)
 	die 1 'unsupported format: %s' "$FORMAT"
 	;;
 esac
+if [[ $FORMAT == 'gpg' ]] && [[ $CONTEXT != 'default' ]]; then
+	die 1 'contexts are not supported with the gpg format'
+fi
 
 # always run our safety checks
 run_safety_checks
