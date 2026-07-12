@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Crypto backend hooks (crypt_NAME_*) are invoked indirectly through
+# crypt_call, which shellcheck cannot see; without this it flags every
+# hook as never invoked.
+# shellcheck disable=SC2329
 set -euo pipefail
 
 #
@@ -265,67 +269,112 @@ hex_to_bin() {
 	fi
 }
 
-git_clean() {
-	context=$(extract_context_name_from_name_value_arg "$1")
-	[[ "$context" ]] && shift
+##### CRYPTO BACKENDS
+#
+# A crypto format named NAME is a set of functions named crypt_NAME_*.
+# Shared machinery only ever calls hooks through crypt_call, so adding a
+# format means writing functions, not threading if/then branches.
+#
+# Required hooks:
+#   clean FILENAME TEMPFILE   stdin (cached in TEMPFILE) -> ciphertext out
+#   smudge TEMPFILE           ciphertext (cached) -> plaintext, fallback cat
+#   textconv FILENAME         decrypt the file to stdout, fallback cat
+#   is_ciphertext FILE        cheap magic-bytes probe
+#   validate_blob             stdin blob -> 0 when valid ciphertext
+#   configure                 collect and persist format settings
+#   confirm                   print pending settings for interactive prompts
+#   display                   print the configured settings
+#
+# Optional hooks; when absent, crypt_call refuses the operation:
+#   rekey_all, flush_credentials, upgrade_creds, export_creds,
+#   import_creds, health, merge_check_sides
+#
+# Formats known to auto-detection (pre-commit checks on unconfigured
+# repositories accept any of these):
+readonly CRYPT_BACKENDS='openssl'
 
-	filename=$1
-	# ignore empty files
-	if [[ ! -s $filename ]]; then
-		return
-	fi
-	# cache STDIN to test if it's already encrypted
-	tempfile=$(mktemp 2>/dev/null || mktemp -t tmp)
-	trap 'rm -f "$tempfile"' EXIT
-	tee "$tempfile" &>/dev/null
-	# the first bytes of an encrypted file are always "Salted" in Base64
-	# The `head + LC_ALL=C tr` command handles binary data in old and new Bash (#116)
-	firstbytes=$(head -c8 "$tempfile" | LC_ALL=C tr -d '\0')
-	if [[ $firstbytes == "U2FsdGVk" ]]; then
-		cat "$tempfile"
-	else
-		context_config_group=$(derive_context_config_group "$context")
-		cipher=$(git config --get --local "transcrypt${context_config_group}.cipher")
-		password=$(load_password "$context_config_group")
-		openssl_path=$(git config --get --local transcrypt.openssl-path)
-		salt=$("${openssl_path}" dgst -hmac "${filename}:${password}" -sha256 "$tempfile" | tr -d '\r\n' | tail -c16)
+# the format in effect for this invocation; filters set it from their
+# format=NAME argument, cold paths from config or the --format flag
+FORMAT='openssl'
 
-		if [ "$(is_salt_prefix_workaround_required)" == "true" ]; then
-			# Encrypt the file to base64, ensuring it includes the prefix 'Salted__' with the salt. #133
-			(
-				echo -n "Salted__" && echo -n "$salt" | hex_to_bin &&
-					# Encrypt file to binary ciphertext
-					ENC_PASS=$password "$openssl_path" enc -e "-${cipher}" -md MD5 -pass env:ENC_PASS -S "$salt" -in "$tempfile"
-			) |
-				openssl base64
-		else
-			# Encrypt file to base64 ciphertext
-			ENC_PASS=$password "$openssl_path" enc -e -a "-${cipher}" -md MD5 -pass env:ENC_PASS -S "$salt" -in "$tempfile"
-		fi
-	fi
+crypt_call() {
+	local op=$1 fn="crypt_${FORMAT}_${1}"
+	shift
+	declare -F "$fn" >/dev/null ||
+		die 1 '%s is not supported with the %s format' "$op" "$FORMAT"
+	"$fn" "$@"
 }
 
-git_smudge() {
-	tempfile=$(mktemp 2>/dev/null || mktemp -t tmp)
-	trap 'rm -f "$tempfile"' EXIT
-	context=$(extract_context_name_from_name_value_arg "$1")
+crypt_supports() {
+	declare -F "crypt_${FORMAT}_${1}" >/dev/null
+}
+
+# Filters configured for a non-default format carry a format=NAME
+# argument (the same mechanism as context=), so the per-file hot path
+# never reads git config. Absence means openssl: repositories configured
+# by upstream transcrypt keep working unchanged.
+# Returns true when the caller should shift the argument away.
+parse_filter_format_arg() {
+	if [[ "${1:-}" == format=* ]]; then
+		FORMAT=${1#format=}
+		return 0
+	fi
+	return 1
+}
+
+##### OPENSSL BACKEND
+#
+# The original transcrypt format: OpenSSL `enc` output (Salted__ magic,
+# base64), key derived from a shared password, deterministic HMAC salt
+# so unchanged plaintext re-encrypts to identical ciphertext.
+
+crypt_openssl_is_ciphertext() {
+	# the first bytes of an encrypted file are always "Salted" in Base64
+	# The `head + LC_ALL=C tr` command handles binary data in old and new Bash (#116)
+	[[ "$(head -c8 -- "$1" 2>/dev/null | LC_ALL=C tr -d '\0')" == 'U2FsdGVk' ]]
+}
+
+crypt_openssl_validate_blob() {
+	[[ "$(head -c8 | LC_ALL=C tr -d '\0')" == 'U2FsdGVk' ]]
+}
+
+crypt_openssl_clean() {
+	local filename=$1 tempfile=$2
+	if crypt_openssl_is_ciphertext "$tempfile"; then
+		cat "$tempfile"
+		return
+	fi
 	context_config_group=$(derive_context_config_group "$context")
 	cipher=$(git config --get --local "transcrypt${context_config_group}.cipher")
 	password=$(load_password "$context_config_group")
 	openssl_path=$(git config --get --local transcrypt.openssl-path)
-	tee "$tempfile" | ENC_PASS=$password "$openssl_path" enc -d "-${cipher}" -md MD5 -pass env:ENC_PASS -a 2>/dev/null || cat "$tempfile"
+	salt=$("${openssl_path}" dgst -hmac "${filename}:${password}" -sha256 "$tempfile" | tr -d '\r\n' | tail -c16)
+
+	if [ "$(is_salt_prefix_workaround_required)" == "true" ]; then
+		# Encrypt the file to base64, ensuring it includes the prefix 'Salted__' with the salt. #133
+		(
+			echo -n "Salted__" && echo -n "$salt" | hex_to_bin &&
+				# Encrypt file to binary ciphertext
+				ENC_PASS=$password "$openssl_path" enc -e "-${cipher}" -md MD5 -pass env:ENC_PASS -S "$salt" -in "$tempfile"
+		) |
+			openssl base64
+	else
+		# Encrypt file to base64 ciphertext
+		ENC_PASS=$password "$openssl_path" enc -e -a "-${cipher}" -md MD5 -pass env:ENC_PASS -S "$salt" -in "$tempfile"
+	fi
 }
 
-git_textconv() {
-	context=$(extract_context_name_from_name_value_arg "$1")
-	[[ "$context" ]] && shift
+crypt_openssl_smudge() {
+	local tempfile=$1
+	context_config_group=$(derive_context_config_group "$context")
+	cipher=$(git config --get --local "transcrypt${context_config_group}.cipher")
+	password=$(load_password "$context_config_group")
+	openssl_path=$(git config --get --local transcrypt.openssl-path)
+	ENC_PASS=$password "$openssl_path" enc -d "-${cipher}" -md MD5 -pass env:ENC_PASS -a -in "$tempfile" 2>/dev/null || cat "$tempfile"
+}
 
-	filename=$1
-	# ignore empty files
-	if [[ ! -s $filename ]]; then
-		return
-	fi
-
+crypt_openssl_textconv() {
+	local filename=$1
 	context_config_group=$(derive_context_config_group "$context")
 	cipher=$(git config --get --local "transcrypt${context_config_group}.cipher")
 	password=$(load_password "$context_config_group")
@@ -333,10 +382,106 @@ git_textconv() {
 	ENC_PASS=$password "$openssl_path" enc -d "-${cipher}" -md MD5 -pass env:ENC_PASS -a -in "$filename" 2>/dev/null || cat "$filename"
 }
 
+crypt_openssl_configure() {
+	get_cipher
+	get_password
+}
+
+crypt_openssl_confirm() {
+	printf '  CIPHER:   %s\n' "$cipher"
+	printf '  PASSWORD: %s\n\n' "$password"
+}
+
+crypt_openssl_save_config() {
+	git config "transcrypt${CONTEXT_CONFIG_GROUP}.cipher" "$cipher"
+	save_password "$password" "$CONTEXT_CONFIG_GROUP"
+	git config transcrypt.openssl-path "$openssl_path"
+}
+
+crypt_openssl_display() {
+	local current_cipher current_password escaped_password contexts_count
+	current_cipher=$(git config --get --local "transcrypt${CONTEXT_CONFIG_GROUP}.cipher")
+	current_password=$(load_password "$CONTEXT_CONFIG_GROUP")
+	escaped_password=${current_password//\'/\'\\\'\'}
+	contexts_count="$(count_items_in_list "$CONFIGURED_CONTEXTS")"
+
+	printf '  CIPHER:   %s\n' "$current_cipher"
+	printf '  PASSWORD: %s\n\n' "$current_password"
+	if [[ "$contexts_count" -gt "1" ]]; then
+		printf 'The repository has %s contexts: %s\n\n' "$contexts_count" "$CONFIGURED_CONTEXTS"
+	fi
+	printf "Copy and paste the following command to initialize a cloned repository%s:\n\n" "$CONTEXT_DESCRIPTION"
+	if [[ $CONTEXT != 'default' ]]; then
+		printf "  transcrypt -C $CONTEXT -c %s -p '%s'\n" "$current_cipher" "$escaped_password"
+	else
+		printf "  transcrypt -c %s -p '%s'\n" "$current_cipher" "$escaped_password"
+	fi
+}
+
+# capability markers: password-credential operations exist only for this
+# format; a format without the marker gets a uniform refusal
+crypt_openssl_flush_credentials() { :; }
+crypt_openssl_upgrade_creds() { :; }
+crypt_openssl_export_creds() { :; }
+crypt_openssl_import_creds() { :; }
+
+##### GIT FILTERS
+
+git_clean() {
+	context=$(extract_context_name_from_name_value_arg "$1")
+	[[ "$context" ]] && shift
+	if parse_filter_format_arg "${1:-}"; then
+		shift
+	fi
+
+	filename=$1
+	# ignore empty files
+	if [[ ! -s $filename ]]; then
+		return
+	fi
+	# cache STDIN so backends can probe and re-read it
+	tempfile=$(mktemp 2>/dev/null || mktemp -t tmp)
+	trap 'rm -f "$tempfile" "$tempfile.plain"' EXIT
+	tee "$tempfile" &>/dev/null
+
+	crypt_call clean "$filename" "$tempfile"
+}
+
+git_smudge() {
+	context=$(extract_context_name_from_name_value_arg "${1:-}")
+	parse_filter_format_arg "${2:-}" || true
+
+	tempfile=$(mktemp 2>/dev/null || mktemp -t tmp)
+	trap 'rm -f "$tempfile"' EXIT
+	tee "$tempfile" &>/dev/null
+
+	crypt_call smudge "$tempfile"
+}
+
+git_textconv() {
+	context=$(extract_context_name_from_name_value_arg "$1")
+	[[ "$context" ]] && shift
+	if parse_filter_format_arg "${1:-}"; then
+		shift
+	fi
+
+	filename=$1
+	# ignore empty files
+	if [[ ! -s $filename ]]; then
+		return
+	fi
+
+	crypt_call textconv "$filename"
+}
+
 # shellcheck disable=SC2005,SC2002,SC2181
 git_merge() {
 	context=$(extract_context_name_from_name_value_arg "$1")
 	[[ "$context" ]] && shift
+	if parse_filter_format_arg "${1:-}"; then
+		shift
+	fi
+	format_arg="format=$FORMAT"
 
 	# Get path to transcrypt in this script's directory
 	TRANSCRYPT_PATH="$(dirname "$0")/transcrypt"
@@ -352,9 +497,14 @@ git_merge() {
 		THEIRS_LABEL="theirs"
 	fi
 	# Decrypt BASE $1, LOCAL $2, and REMOTE $3 versions of file being merged
-	echo "$(cat "$1" | "${TRANSCRYPT_PATH}" smudge context="$context")" >"$1"
-	echo "$(cat "$2" | "${TRANSCRYPT_PATH}" smudge context="$context")" >"$2"
-	echo "$(cat "$3" | "${TRANSCRYPT_PATH}" smudge context="$context")" >"$3"
+	echo "$(cat "$1" | "${TRANSCRYPT_PATH}" smudge context="$context" "$format_arg")" >"$1"
+	echo "$(cat "$2" | "${TRANSCRYPT_PATH}" smudge context="$context" "$format_arg")" >"$2"
+	echo "$(cat "$3" | "${TRANSCRYPT_PATH}" smudge context="$context" "$format_arg")" >"$3"
+	# a backend that can fail to decrypt (eg: gpg without a secret key)
+	# must abort here rather than let raw ciphertext be merged as text
+	if crypt_supports merge_check_sides; then
+		crypt_call merge_check_sides "$1" "$2" "$3" "$5"
+	fi
 	# Merge the decrypted files to the temp file named by $2
 	git merge-file --marker-size="$4" -L "$OURS_LABEL" -L base -L "$THEIRS_LABEL" "$2" "$1" "$3"
 	# If the merge was not successful (has conflicts) exit with an error code to
@@ -373,14 +523,62 @@ git_merge() {
 	cp "$2" "$5"
 	# Now we use the `clean` script to encrypt the merged file contents back to the
 	# temp file $2 where Git expects to find the merge result content.
-	cat "$5" | "${TRANSCRYPT_PATH}" clean context="$context" "$5" >"$2"
+	cat "$5" | "${TRANSCRYPT_PATH}" clean context="$context" "$format_arg" "$5" >"$2"
 }
 
 # shellcheck disable=SC2155
 git_pre_commit() {
-	# Transcrypt pre-commit hook: fail if secret file in staging lacks the magic prefix "Salted" in B64
+	# Transcrypt pre-commit hook: fail if a secret file staged in the
+	# index is not valid ciphertext for the repository's format
 	tmp=$(mktemp)
 	IFS=$'\n'
+	# Configured repositories validate against their format; unconfigured
+	# ones (--check on a fresh CI checkout) accept any known format
+	local mode
+	mode=$(git config --get --local transcrypt.format 2>/dev/null || true)
+	if [[ ! $mode ]] && [[ $(git config --get --local transcrypt.version 2>/dev/null || true) ]]; then
+		mode='openssl'
+	fi
+	if [[ $mode ]]; then
+		FORMAT=$mode
+	fi
+
+	# true (0) when the staged blob for $1 is not acceptable ciphertext,
+	# setting staged_blob_reason to 'plaintext' or 'corrupt'
+	staged_blob_bad() {
+		local f=$1 blob b
+		staged_blob_reason=''
+		blob=$(git show :"$f" 2>/dev/null || true)
+		# An empty file does not need to be, and is not, encrypted
+		[[ $blob ]] || return 1
+		if [[ $mode ]]; then
+			if crypt_call validate_blob <<<"$blob"; then
+				return 1
+			fi
+			# right format prefix but invalid content means the blob was
+			# edited or corrupted while encrypted, not staged as plaintext
+			staged_blob_reason='plaintext'
+			if crypt_supports blob_prefix_matches && crypt_call blob_prefix_matches "$blob"; then
+				staged_blob_reason='corrupt'
+			fi
+			return 0
+		fi
+		for b in $CRYPT_BACKENDS; do
+			if "crypt_${b}_validate_blob" <<<"$blob" 2>/dev/null; then
+				return 1
+			fi
+		done
+		staged_blob_reason='plaintext'
+		return 0
+	}
+
+	print_restage_help() {
+		printf '\n' >&2
+		printf '    git rm --cached -- %s\n' "$1" >&2
+		printf '    git add %s\n' "$1" >&2
+		printf '\n' >&2
+	}
+
 	slow_mode_if_failed() {
 		for secret_file in $(_list_encrypted_files); do
 			# Skip symlinks, they contain the linked target file path not plaintext
@@ -388,13 +586,16 @@ git_pre_commit() {
 				continue
 			fi
 
-			# Get prefix of raw file in Git's index using the :FILENAME revision syntax
-			local firstbytes=$(git show :"${secret_file}" | head -c8)
-			# An empty file does not need to be, and is not, encrypted
-			if [[ $firstbytes == "" ]]; then
+			if ! staged_blob_bad "$secret_file"; then
 				: # Do nothing
-			# The first bytes of an encrypted file must be "Salted" in Base64
-			elif [[ $firstbytes != "U2FsdGVk" ]]; then
+			elif [[ $staged_blob_reason == 'corrupt' ]]; then
+				printf 'Transcrypt managed file is not valid ciphertext in the Git index: %s\n' "$secret_file" >&2
+				printf '\n' >&2
+				printf 'The file was probably edited or corrupted while encrypted. Restore it\n' >&2
+				printf 'from a known-good commit, or re-stage the real plaintext:\n' >&2
+				print_restage_help "$secret_file"
+				exit 1
+			else
 				printf 'Transcrypt managed file is not encrypted in the Git index: %s\n' "$secret_file" >&2
 				printf '\n' >&2
 				printf 'You probably staged this file using a tool that does not apply' >&2
@@ -402,10 +603,7 @@ git_pre_commit() {
 				printf '\n' >&2
 				printf 'Fix this by re-staging the file with a compatible tool or with'
 				printf ' Git on the command line:\n' >&2
-				printf '\n' >&2
-				printf '    git rm --cached -- %s\n' "$secret_file" >&2
-				printf '    git add %s\n' "$secret_file" >&2
-				printf '\n' >&2
+				print_restage_help "$secret_file"
 				exit 1
 			fi
 		done
@@ -418,12 +616,7 @@ git_pre_commit() {
 		if [[ -L $secret_file ]]; then
 			return
 		fi
-		# Get prefix of raw file in Git's index using the :FILENAME revision syntax
-		# The first bytes of an encrypted file are always "Salted" in Base64
-		local firstbytes=$(git show :"${secret_file}" | head -c8)
-		if [[ $firstbytes == "" ]]; then
-			: # Do nothing
-		elif [[ $firstbytes != "U2FsdGVk" ]]; then
+		if staged_blob_bad "$secret_file"; then
 			echo "true" >>"${tmp}"
 		fi
 	}
@@ -454,8 +647,14 @@ git_pre_commit() {
 
 # Add file patterns to .gitattributes
 add_pattern() {
+	# a backend may need extra attributes on its patterns (eg: gpg adds
+	# -text to keep eol conversion away from armored ciphertext)
+	local extra_attrs=''
+	if crypt_supports extra_attrs; then
+		extra_attrs=" $(crypt_call extra_attrs)"
+	fi
 	for var in "$@"; do
-		line="$var  filter=crypt${CONTEXT_CRYPT_SUFFIX} diff=crypt${CONTEXT_CRYPT_SUFFIX} merge=crypt${CONTEXT_CRYPT_SUFFIX}"
+		line="$var  filter=crypt${CONTEXT_CRYPT_SUFFIX} diff=crypt${CONTEXT_CRYPT_SUFFIX} merge=crypt${CONTEXT_CRYPT_SUFFIX}${extra_attrs}"
 		grep -qxF "$line" "${GIT_ATTRIBUTES}" || echo "$line" >>"${GIT_ATTRIBUTES}"
 		sync
 	done
@@ -579,18 +778,22 @@ get_password() {
 	done
 }
 
-# confirm the transcrypt configuration
-confirm_configuration() {
-	local answer=
-
+# print the repository metadata and the backend's pending settings
+print_pending_configuration() {
 	printf '\nRepository metadata:\n\n'
 	[[ ! $REPO ]] || printf '  GIT_WORK_TREE:  %s\n' "$REPO"
 	printf '  GIT_DIR:        %s\n' "$GIT_DIR"
 	printf '  GIT_ATTRIBUTES: %s\n\n' "$GIT_ATTRIBUTES"
 	printf 'The following configuration will be saved:\n\n'
 	printf '  CONTEXT:  %s\n' "$CONTEXT"
-	printf '  CIPHER:   %s\n' "$cipher"
-	printf '  PASSWORD: %s\n\n' "$password"
+	crypt_call confirm
+}
+
+# confirm the transcrypt configuration
+confirm_configuration() {
+	local answer=
+
+	print_pending_configuration
 	printf 'Does this look correct? [Y/n] '
 	read -r -n 1 -s answer
 
@@ -607,14 +810,7 @@ confirm_configuration() {
 confirm_rekey() {
 	local answer=
 
-	printf '\nRepository metadata:\n\n'
-	[[ ! $REPO ]] || printf '  GIT_WORK_TREE:  %s\n' "$REPO"
-	printf '  GIT_DIR:        %s\n' "$GIT_DIR"
-	printf '  GIT_ATTRIBUTES: %s\n\n' "$GIT_ATTRIBUTES"
-	printf 'The following configuration will be saved:\n\n'
-	printf '  CONTEXT:  %s\n' "$CONTEXT"
-	printf '  CIPHER:   %s\n' "$cipher"
-	printf '  PASSWORD: %s\n\n' "$password"
+	print_pending_configuration
 	printf 'You are about to re-encrypt all encrypted files using new credentials.\n'
 	printf 'Once you do this, their historical diffs will no longer display in plain text.\n\n'
 	printf 'Proceed with rekey? [y/N] '
@@ -718,19 +914,30 @@ save_configuration() {
 
 	# write the encryption info
 	git config transcrypt.version "$VERSION"
-	git config "transcrypt${CONTEXT_CONFIG_GROUP}.cipher" "$cipher"
-	save_password "$password" "$CONTEXT_CONFIG_GROUP"
-	git config transcrypt.openssl-path "$openssl_path"
+	crypt_call save_config
+	# record non-default formats; absence means openssl, so repositories
+	# configured by upstream transcrypt read back identically
+	if [[ $FORMAT != 'openssl' ]]; then
+		git config transcrypt.format "$FORMAT"
+	fi
 
 	# write the filter settings. Sorry for the horrific quote escaping below...
 	# shellcheck disable=SC2016
 	transcrypt_path='"$(git config transcrypt.crypt-dir 2>/dev/null || printf %s/crypt ""$(git rev-parse --git-common-dir)"")"/transcrypt'
 
+	# non-default formats travel as a filter argument so the per-file hot
+	# path never reads config; openssl commands stay byte-identical to
+	# upstream's
+	local format_arg=''
+	if [[ $FORMAT != 'openssl' ]]; then
+		format_arg=" format=$FORMAT"
+	fi
+
 	# Ensure filter attributes are always set for the default (unspecified) context
-	git config filter.crypt.clean "$transcrypt_path clean context=default %f"
-	git config filter.crypt.smudge "$transcrypt_path smudge context=default"
-	git config diff.crypt.textconv "$transcrypt_path textconv context=default"
-	git config merge.crypt.driver "$transcrypt_path merge context=default %O %A %B %L %P"
+	git config filter.crypt.clean "$transcrypt_path clean context=default$format_arg %f"
+	git config filter.crypt.smudge "$transcrypt_path smudge context=default$format_arg"
+	git config diff.crypt.textconv "$transcrypt_path textconv context=default$format_arg"
+	git config merge.crypt.driver "$transcrypt_path merge context=default$format_arg %O %A %B %L %P"
 
 	# Also set filter attributes for a non-default context, if necessary
 	if [[ ! "$CONTEXT" = 'default' ]]; then
@@ -764,31 +971,13 @@ save_configuration() {
 
 # display the current configuration settings
 display_configuration() {
-	local current_cipher
-	current_cipher=$(git config --get --local "transcrypt${CONTEXT_CONFIG_GROUP}.cipher")
-	local current_password
-	current_password=$(load_password "$CONTEXT_CONFIG_GROUP")
-	local escaped_password=${current_password//\'/\'\\\'\'}
-
-	contexts_count="$(count_items_in_list "$CONFIGURED_CONTEXTS")"
-
 	printf 'The current repository was configured using transcrypt version %s\n' "$INSTALLED_VERSION"
 	printf "and has the following configuration%s:\n\n" "$CONTEXT_DESCRIPTION"
 	[[ ! $REPO ]] || printf '  GIT_WORK_TREE:  %s\n' "$REPO"
 	printf '  GIT_DIR:        %s\n' "$GIT_DIR"
 	printf '  GIT_ATTRIBUTES: %s\n\n' "$GIT_ATTRIBUTES"
 	printf '  CONTEXT:  %s\n' "$CONTEXT"
-	printf '  CIPHER:   %s\n' "$current_cipher"
-	printf '  PASSWORD: %s\n\n' "$current_password"
-	if [[ "$contexts_count" -gt "1" ]]; then
-		printf 'The repository has %s contexts: %s\n\n' "$contexts_count" "$CONFIGURED_CONTEXTS"
-	fi
-	printf "Copy and paste the following command to initialize a cloned repository%s:\n\n" "$CONTEXT_DESCRIPTION"
-	if [[ $CONTEXT != 'default' ]]; then
-		printf "  transcrypt -C $CONTEXT -c %s -p '%s'\n" "$current_cipher" "$escaped_password"
-	else
-		printf "  transcrypt -c %s -p '%s'\n" "$current_cipher" "$escaped_password"
-	fi
+	crypt_call display
 }
 
 # remove transcrypt-related settings from the repository's git config
@@ -837,6 +1026,9 @@ force_checkout() {
 # remove the locally cached encryption credentials and
 # re-encrypt any files that had been previously decrypted
 flush_credentials() {
+	if ! crypt_supports flush_credentials; then
+		die 1 '--flush-credentials is not supported with the %s format' "$FORMAT"
+	fi
 	local answer=
 
 	if [[ $interactive ]]; then
@@ -990,6 +1182,9 @@ uninstall_transcrypt() {
 
 # uninstall and re-install transcrypt to upgrade scripts and update configuration
 upgrade_transcrypt() {
+	if ! crypt_supports upgrade_creds; then
+		die 1 '--upgrade is not supported with the %s format' "$FORMAT"
+	fi
 	# Fail with an error if we cannot read the existing config
 	if [[ ! $INSTALLED_VERSION ]]; then
 		die 1 'no existing transcrypt configuration found'
@@ -1105,6 +1300,9 @@ show_raw_file() {
 
 # export password and cipher to a gpg encrypted file
 export_gpg() {
+	if ! crypt_supports export_creds; then
+		die 1 '--export-gpg is not supported with the %s format' "$FORMAT"
+	fi
 	# check for dependencies
 	command -v gpg >/dev/null || die 'required command "gpg" was not found'
 
@@ -1126,6 +1324,9 @@ export_gpg() {
 
 # import password and cipher from a gpg encrypted file
 import_gpg() {
+	if ! crypt_supports import_creds; then
+		die 1 '--import-gpg is not supported with the %s format' "$FORMAT"
+	fi
 	# check for dependencies
 	command -v gpg >/dev/null || die 'required command "gpg" was not found'
 
@@ -1162,6 +1363,10 @@ get_contexts_from_git_config() {
 	contexts=()
 	for name in $config_names; do
 		if [[ "$name" = "transcrypt.password" ]]; then
+			contexts+=('default')
+		elif [[ "$name" = "transcrypt.format" ]]; then
+			# formats without a password store this key instead; it marks
+			# the default context as configured
 			contexts+=('default')
 		elif [[ $name =~ $extract_context_name_regex ]]; then
 			contexts+=("${BASH_REMATCH[1]}")
@@ -1304,6 +1509,12 @@ help() {
 		            the password to derive the key from;
 		            defaults to 30 random base64 characters
 
+
+		     --check
+		            verify that every encrypted file in the index is valid
+		            ciphertext and report recipient key health; needs no
+		            configuration or keys, for use in CI
+
 		     --set-openssl-path=PATH_TO_OPENSSL
 		            use OpenSSL at this path; defaults to 'openssl' in \$PATH
 
@@ -1445,6 +1656,7 @@ help() {
 
 # reset all variables that might be set
 context=''
+check_files=''
 cipher=''
 display_config=''
 add_pattern=''
@@ -1528,6 +1740,10 @@ while [[ "${1:-}" != '' ]]; do
 		;;
 	--context=*)
 		context=${1#*=}
+		;;
+	--check)
+		check_files='true'
+		requires_clean_repo=''
 		;;
 	--set-openssl-path=*)
 		openssl_path=${1#*=}
@@ -1643,6 +1859,20 @@ set_context_globals
 
 gather_repo_metadata
 
+# resolve the format for non-filter operations: an explicit --format
+# flag wins, else any configured format, defaulting to openssl
+FORMAT=$(git config --get --local transcrypt.format 2>/dev/null || echo 'openssl')
+case $FORMAT in
+openssl) ;;
+legacy)
+	# accepted as input for the openssl format, never stored
+	FORMAT='openssl'
+	;;
+*)
+	die 1 'unsupported format: %s' "$FORMAT"
+	;;
+esac
+
 # always run our safety checks
 run_safety_checks
 
@@ -1653,6 +1883,14 @@ readonly YES_REGEX='^[Yy]$'
 # specified in, we must run these here rather than in the case statement above
 if [[ $list ]]; then
 	list_files
+	exit 0
+elif [[ $check_files ]]; then
+	cd "$REPO" >/dev/null || die 1 'could not change into the "%s" directory' "$REPO"
+	git_pre_commit
+	if crypt_supports health; then
+		crypt_call health
+	fi
+	printf 'All encrypted files in the index are valid ciphertext.\n'
 	exit 0
 elif [[ $uninstall ]]; then
 	uninstall_transcrypt
@@ -1694,8 +1932,7 @@ count_dirty_files() {
 readonly GIT_DIRTY_FILES_BEFORE_INIT="$(count_dirty_files)"
 
 # perform function calls to configure transcrypt
-get_cipher
-get_password
+crypt_call configure
 
 if [[ $rekey ]] && [[ $interactive ]]; then
 	confirm_rekey
@@ -1706,6 +1943,9 @@ fi
 save_configuration
 
 if [[ $rekey ]]; then
+	if crypt_supports rekey_prepare; then
+		crypt_call rekey_prepare
+	fi
 	stage_rekeyed_files
 else
 	force_checkout
