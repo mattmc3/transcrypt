@@ -2,7 +2,7 @@
 
 load "$BATS_TEST_DIRNAME/_gpg_helper.bash"
 
-# Operations that only make sense for the password-based legacy format
+# Operations that only make sense for the password-based openssl format
 # must refuse loudly on gpg-format repositories instead of half-working.
 
 @test "unsupported: --upgrade refuses on the gpg format" {

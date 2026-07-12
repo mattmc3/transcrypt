@@ -26,7 +26,7 @@ The transcrypt source code and full documentation may be downloaded from
     defaults to 30 random base64 characters
 
   * `--format`=<format>:
-    encryption format: 'legacy' (OpenSSL symmetric cipher) or 'gpg'
+    encryption format: 'openssl' (OpenSSL symmetric cipher, the default) or 'gpg'
     (encrypt to gpg recipient public keys)
 
   * `--gpg-recipient`=<keyid>:

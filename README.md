@@ -61,7 +61,22 @@ The requirements to run transcrypt are minimal:
 
 ...and optionally:
 
-- GnuPG - for secure configuration import/export
+- GnuPG - for secure configuration import/export, or for the gpg
+  encryption format
+
+### GPG format
+
+This fork adds a gpg encryption format that encrypts to the public keys
+of one or more gpg recipients instead of deriving a symmetric key from a
+shared password:
+
+    $ transcrypt --format=gpg \
+        --gpg-recipient=662E63E410C1AF41 \
+        --gpg-recipient=1A6B4E9FC96C1D2B --yes
+
+See [docs/transcrypt-gpg.md](docs/transcrypt-gpg.md) for the full
+documentation: recipient management, rekeying, `--check` validation,
+and safety behavior.
 
 You also need access to the _transcrypt_ script itself. You can add it directly
 to your repository, or just put it somewhere in your \$PATH:
@@ -203,6 +218,20 @@ directory.
       -p, --password=PASSWORD
              the password to derive the key from;
              defaults to 30 random base64 characters
+
+      --format=FORMAT
+             encryption format: 'openssl' (OpenSSL symmetric cipher, the default) or
+             'gpg' (encrypt to gpg recipient public keys)
+
+      --gpg-recipient=KEYID
+             gpg key to encrypt to; repeat for multiple recipients.
+             Requires --format=gpg. Keys must be in the gpg keyring
+             (set transcrypt.gnupghome to use an alternate keyring)
+
+      --check
+             verify that every encrypted file in the index is valid
+             ciphertext and report recipient key health; needs no
+             configuration or keys, for use in CI
 
       --set-openssl-path=PATH_TO_OPENSSL
              use OpenSSL at this path; defaults to 'openssl' in $PATH

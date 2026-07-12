@@ -687,7 +687,7 @@ git_merge() {
 	if parse_filter_format_arg "${1:-}"; then
 		shift
 	fi
-	format_arg='format=legacy'
+	format_arg='format=openssl'
 	if [[ $gpg_format ]]; then
 		format_arg='format=gpg'
 	fi
@@ -753,7 +753,7 @@ git_pre_commit() {
 	if is_gpg_format; then
 		mode='gpg'
 	elif [[ $(git config --get --local transcrypt.version 2>/dev/null || true) ]]; then
-		mode='legacy'
+		mode='openssl'
 	fi
 
 	# true (0) when the staged blob for $1 is not acceptable ciphertext,
@@ -777,7 +777,7 @@ git_pre_commit() {
 			return 1
 			;;
 		'-----BEG')
-			if [[ $mode == 'legacy' ]]; then
+			if [[ $mode == 'openssl' ]]; then
 				staged_blob_reason='plaintext'
 				return 0
 			fi
@@ -1178,7 +1178,7 @@ save_configuration() {
 
 	# the gpg format is selected by an explicit argument in the filter
 	# commands, so filters never read config on the per-file hot path;
-	# legacy commands stay identical to upstream's
+	# password-format commands stay identical to upstream's
 	local format_arg=''
 	if [[ $format == 'gpg' ]]; then
 		format_arg=' format=gpg'
@@ -1825,7 +1825,7 @@ help() {
 		            defaults to 30 random base64 characters
 
 		     --format=FORMAT
-		            encryption format: 'legacy' (OpenSSL symmetric cipher) or
+		            encryption format: 'openssl' (OpenSSL symmetric cipher, the default) or
 		            'gpg' (encrypt to gpg recipient public keys)
 
 		     --gpg-recipient=KEYID
@@ -2263,7 +2263,7 @@ if [[ ! $format ]] && is_gpg_format; then
 	format='gpg'
 fi
 case $format in
-'' | legacy | gpg) ;;
+'' | openssl | legacy | gpg) ;;
 *) die 1 'unsupported format: %s' "$format" ;;
 esac
 
