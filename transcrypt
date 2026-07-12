@@ -371,23 +371,76 @@ gpg_encrypt_file() {
 	if [[ ${#recipient_args[@]} -eq 0 ]]; then
 		die 1 'no gpg recipients configured; set transcrypt.gpg-recipient'
 	fi
-	gpg_cmd --batch --quiet --yes --trust-model always --armor --encrypt \
-		"${recipient_args[@]}" --output - -- "$infile"
+	if ! gpg_cmd --batch --quiet --yes --trust-model always --armor --encrypt \
+		"${recipient_args[@]}" --output - -- "$infile"; then
+		die 1 'gpg encryption failed; check the recipient keys with `gpg --list-keys` (an expired or revoked key cannot encrypt) and rekey after fixing them'
+	fi
 }
 
 # resolve a recipient identifier (email, key id, fingerprint) to the full
 # fingerprint of exactly one key in the keyring
 resolve_gpg_recipient() {
 	local ident=$1
-	local fprs
-	# primary-key fingerprints only: the fpr line following each pub line
-	fprs=$(gpg_cmd --list-keys --with-colons -- "$ident" 2>/dev/null |
-		awk -F: '$1 == "pub" {p=1} p && $1 == "fpr" {print $10; p=0}')
-	[[ $fprs ]] || die 1 'gpg recipient key "%s" was not found in the keyring' "$ident"
-	if [[ $(echo "$fprs" | wc -l) -gt 1 ]]; then
+	local matches
+	# validity and primary-key fingerprint: the fpr line after each pub line
+	matches=$(gpg_cmd --list-keys --with-colons -- "$ident" 2>/dev/null |
+		awk -F: '$1 == "pub" {v=$2; p=1} p && $1 == "fpr" {print v ":" $10; p=0}')
+	[[ $matches ]] || die 1 'gpg recipient key "%s" was not found in the keyring' "$ident"
+	if [[ $(echo "$matches" | wc -l) -gt 1 ]]; then
 		die 1 'gpg recipient "%s" matches more than one key; use a fingerprint' "$ident"
 	fi
-	printf '%s\n' "$fprs"
+	case ${matches%%:*} in
+	e | r | d | n)
+		die 1 'gpg recipient key "%s" is not usable (expired, revoked, or disabled)' "$ident"
+		;;
+	esac
+	printf '%s\n' "${matches#*:}"
+}
+
+# report the health of every configured recipient key; fails when any
+# key in the keyring is expired, revoked, or disabled. Keys absent from
+# the keyring are reported but tolerated (CI machines hold no keys).
+check_gpg_recipient_health() {
+	is_gpg_format || return 0
+	local now bad='' fpr keyinfo validity expires uid expiry_date
+	now=$(date +%s)
+	while IFS= read -r fpr; do
+		[[ $fpr ]] || continue
+		keyinfo=$(gpg_cmd --list-keys --with-colons -- "$fpr" 2>/dev/null || true)
+		# --with-colons always emits a tru: trustdb line; only a pub line
+		# means the key is actually present
+		if ! echo "$keyinfo" | grep -q '^pub:'; then
+			printf 'recipient %s: not in this keyring (health unknown)\n' "$fpr"
+			continue
+		fi
+		validity=$(echo "$keyinfo" | awk -F: '$1 == "pub" {print $2; exit}')
+		expires=$(echo "$keyinfo" | awk -F: '$1 == "pub" {print $7; exit}')
+		uid=$(echo "$keyinfo" | awk -F: '$1 == "uid" {print $10; exit}')
+		case $validity in
+		e)
+			printf 'recipient %s (%s): EXPIRED\n' "$fpr" "$uid"
+			bad='true'
+			;;
+		r)
+			printf 'recipient %s (%s): REVOKED\n' "$fpr" "$uid"
+			bad='true'
+			;;
+		d)
+			printf 'recipient %s (%s): DISABLED\n' "$fpr" "$uid"
+			bad='true'
+			;;
+		*)
+			if [[ $expires ]] && ((expires - now < 30 * 86400)); then
+				expiry_date=$(date -r "$expires" +%Y-%m-%d 2>/dev/null ||
+					date -d "@$expires" +%Y-%m-%d 2>/dev/null || echo "$expires")
+				printf 'recipient %s (%s): expires soon, on %s\n' "$fpr" "$uid" "$expiry_date"
+			fi
+			;;
+		esac
+	done < <(git config --get-all --local transcrypt.gpg-recipient 2>/dev/null || true)
+	if [[ $bad ]]; then
+		die 1 'unusable recipient keys found; renew or replace them (eg: `gpg --quick-set-expire <fpr> 2y`), then rekey'
+	fi
 }
 
 # fail configuration, listing the key ids existing ciphertext is encrypted to
@@ -455,9 +508,21 @@ git_clean_gpg() {
 	oldfile=$(mktemp 2>/dev/null || mktemp -t tmp)
 	trap 'rm -f "$tempfile" "$oldfile"' EXIT
 	tee "$tempfile" &>/dev/null
-	# already-encrypted input passes through untouched
+	# already-encrypted input passes through untouched, except during a
+	# rekey: passing it through would silently keep the old recipients,
+	# so decrypt and re-encrypt it, or fail the rekey loudly
 	firstbytes=$(head -c8 "$tempfile" | LC_ALL=C tr -d '\0')
 	if [[ $firstbytes == '-----BEG' ]]; then
+		if [[ "${TRANSCRYPT_GPG_REKEY:-}" ]]; then
+			if gpg_cmd --batch --quiet --decrypt -- "$tempfile" >"$tempfile.plain" 2>/dev/null; then
+				gpg_encrypt_file "$tempfile.plain"
+				rm -f "$tempfile.plain"
+				return
+			fi
+			rm -f "$tempfile.plain"
+			warn 'cannot rekey "%s": unable to decrypt it with the available keys' "$filename"
+			exit 1
+		fi
 		cat "$tempfile"
 		return
 	fi
@@ -604,6 +669,17 @@ git_merge() {
 	echo "$(cat "$1" | "${TRANSCRYPT_PATH}" smudge context="$context")" >"$1"
 	echo "$(cat "$2" | "${TRANSCRYPT_PATH}" smudge context="$context")" >"$2"
 	echo "$(cat "$3" | "${TRANSCRYPT_PATH}" smudge context="$context")" >"$3"
+	# gpg smudge falls back to raw ciphertext when it cannot decrypt; merging
+	# armor text and re-encrypting it as plaintext would destroy the secret,
+	# so abort and leave the merge for a machine that holds a secret key
+	if is_gpg_format; then
+		for side in "$1" "$2" "$3"; do
+			if [[ "$(head -c8 "$side" 2>/dev/null)" == '-----BEG' ]]; then
+				warn 'cannot decrypt "%s" during merge (missing secret key?); aborting to avoid corrupting it' "$5"
+				exit 1
+			fi
+		done
+	fi
 	# Merge the decrypted files to the temp file named by $2
 	git merge-file --marker-size="$4" -L "$OURS_LABEL" -L base -L "$THEIRS_LABEL" "$2" "$1" "$3"
 	# If the merge was not successful (has conflicts) exit with an error code to
@@ -1174,6 +1250,11 @@ force_checkout() {
 # remove the locally cached encryption credentials and
 # re-encrypt any files that had been previously decrypted
 flush_credentials() {
+	# the gpg format stores no local credentials; the private key is the
+	# credential and lives in the gpg keyring
+	if is_gpg_format; then
+		die 1 '--flush-credentials is not supported with the gpg format'
+	fi
 	local answer=
 
 	if [[ $interactive ]]; then
@@ -1331,6 +1412,9 @@ uninstall_transcrypt() {
 
 # uninstall and re-install transcrypt to upgrade scripts and update configuration
 upgrade_transcrypt() {
+	if is_gpg_format; then
+		die 1 '--upgrade is not supported with the gpg format'
+	fi
 	# Fail with an error if we cannot read the existing config
 	if [[ ! $INSTALLED_VERSION ]]; then
 		die 1 'no existing transcrypt configuration found'
@@ -1453,6 +1537,9 @@ show_raw_file() {
 
 # export password and cipher to a gpg encrypted file
 export_gpg() {
+	if is_gpg_format; then
+		die 1 '--export-gpg is not supported with the gpg format (there is no password to export)'
+	fi
 	# check for dependencies
 	command -v gpg >/dev/null || die 'required command "gpg" was not found'
 
@@ -1474,6 +1561,9 @@ export_gpg() {
 
 # import password and cipher from a gpg encrypted file
 import_gpg() {
+	if is_gpg_format; then
+		die 1 '--import-gpg is not supported with the gpg format (there is no password to import)'
+	fi
 	# check for dependencies
 	command -v gpg >/dev/null || die 'required command "gpg" was not found'
 
@@ -2048,6 +2138,7 @@ if [[ $list ]]; then
 elif [[ $check_files ]]; then
 	cd "$REPO" >/dev/null || die 1 'could not change into the "%s" directory' "$REPO"
 	git_pre_commit
+	check_gpg_recipient_health
 	printf 'All encrypted files in the index are valid ciphertext.\n'
 	exit 0
 elif [[ $uninstall ]]; then
@@ -2097,6 +2188,10 @@ case $format in
 '' | legacy | gpg) ;;
 *) die 1 'unsupported format: %s' "$format" ;;
 esac
+
+if [[ $format == 'gpg' ]] && [[ $CONTEXT != 'default' ]]; then
+	die 1 'contexts are not supported with the gpg format'
+fi
 
 # perform function calls to configure transcrypt
 if [[ $format == 'gpg' ]]; then

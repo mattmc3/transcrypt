@@ -34,6 +34,10 @@ encryption format: \'legacy\' (OpenSSL symmetric cipher) or \'gpg\' (encrypt to 
 gpg key to encrypt to; repeat for multiple recipients\. Requires \-\-format=gpg\. Keys must be in the gpg keyring (set transcrypt\.gnupghome to use an alternate keyring)
 .
 .TP
+\fB\-\-check\fR
+verify that every encrypted file in the index is valid ciphertext and report recipient key health; needs no configuration or keys, for use in CI
+.
+.TP
 \fB\-y\fR, \fB\-\-yes\fR
 assume yes and accept defaults for non\-specified options
 .

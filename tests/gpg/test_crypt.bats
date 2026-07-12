@@ -128,6 +128,39 @@ PGP_HEADER="-----BEGIN PGP MESSAGE-----"
   [[ "$output" = *"re-encrypting"* ]]
 }
 
+@test "crypt: rekey re-encrypts a ciphertext working copy when a key is available" {
+  encrypt_named_file sensitive_file "$SECRET_CONTENT"
+
+  # working copy holds raw ciphertext (as after a filterless checkout);
+  # git treats that as dirty under a required filter, hence --force
+  git show HEAD:sensitive_file --no-textconv > sensitive_file
+
+  git config --add transcrypt.gpg-recipient "$CHARLIE_FPR"
+  run $TRANSCRYPT --rekey --yes --force
+  [ "$status" -eq 0 ]
+
+  count=$(git show :0:sensitive_file --no-textconv | recipient_count)
+  [ "$count" -eq 3 ]
+}
+
+@test "crypt: rekey fails loudly when a file cannot be decrypted" {
+  encrypt_named_file sensitive_file "$SECRET_CONTENT"
+
+  # working copy holds raw ciphertext and no secret key is available:
+  # silently keeping the old recipients would defeat the rekey
+  git show HEAD:sensitive_file --no-textconv > sensitive_file
+  blob_before=$(git rev-parse :0:sensitive_file)
+  pubhome=$(make_pubkey_only_home)
+  git config --local transcrypt.gnupghome "$pubhome"
+
+  run $TRANSCRYPT --rekey --yes --force
+  [ "$status" -ne 0 ]
+  [[ "$output" = *"cannot rekey"* ]]
+
+  # the index still holds the old ciphertext, not silent garbage
+  [ "$(git rev-parse :0:sensitive_file)" = "$blob_before" ]
+}
+
 @test "crypt: rekey drops removed recipient" {
   encrypt_named_file sensitive_file "$SECRET_CONTENT"
 
@@ -137,6 +170,81 @@ PGP_HEADER="-----BEGIN PGP MESSAGE-----"
 
   count=$(git show :0:sensitive_file --no-textconv | recipient_count)
   [ "$count" -eq 1 ]
+}
+
+@test "crypt: encryption failure reports unusable recipient keys" {
+  encrypt_named_file sensitive_file "$SECRET_CONTENT"
+
+  # a key that expired after configuration, added behind validation's back
+  git config --add transcrypt.gpg-recipient "$EXPIRED_FPR"
+
+  echo "changed secret" > sensitive_file
+  run git add sensitive_file
+  [ "$status" -ne 0 ]
+  [[ "$output" = *"encryption failed"* ]]
+}
+
+@test "crypt: handle challenging file names when 'core.quotePath=true'" {
+  git config --local --add core.quotePath true
+  FILENAME="Mig – røve"  # Danish
+
+  encrypt_named_file "$FILENAME" "$SECRET_CONTENT"
+
+  run cat "$FILENAME"
+  [ "$status" -eq 0 ]
+  [ "${lines[0]}" = "$SECRET_CONTENT" ]
+
+  run git show HEAD:"$FILENAME" --no-textconv
+  [ "$status" -eq 0 ]
+  [ "${lines[0]}" = "$PGP_HEADER" ]
+
+  run git ls-crypt
+  [ "$status" -eq 0 ]
+  [[ "${output}" = *"$FILENAME" ]]
+}
+
+@test "crypt: handle file name with quotes and brackets" {
+  FILENAME='"Difficult file name""")))(((][][].secret'
+  echo "$SECRET_CONTENT" > "$FILENAME"
+  echo "*.secret filter=crypt diff=crypt merge=crypt" >> .gitattributes
+  git add .gitattributes "$FILENAME"
+  git commit -m "Encrypt difficult filename"
+
+  run cat "$FILENAME"
+  [ "$status" -eq 0 ]
+  [ "${lines[0]}" = "$SECRET_CONTENT" ]
+
+  run git show HEAD:"\"Difficult file name\"\"\")))(((][][].secret" --no-textconv
+  [ "$status" -eq 0 ]
+  [ "${lines[0]}" = "$PGP_HEADER" ]
+
+  rm -f "$FILENAME"
+}
+
+@test "crypt: handle very small file" {
+  FILENAME="small file.txt"
+  SMALL_CONTENT="sh"
+
+  encrypt_named_file "$FILENAME" "$SMALL_CONTENT"
+
+  run git show HEAD:"$FILENAME" --no-textconv
+  [ "$status" -eq 0 ]
+  [ "${lines[0]}" = "$PGP_HEADER" ]
+
+  run git show HEAD:"$FILENAME" --textconv
+  [ "$status" -eq 0 ]
+  [ "${lines[0]}" = "$SMALL_CONTENT" ]
+}
+
+@test "crypt: empty file is stored empty, not encrypted" {
+  touch empty_file
+  encrypt_named_file empty_file
+
+  # by design: an empty file has nothing to protect and stays empty,
+  # which also means emptiness itself is visible in the repository
+  run git show HEAD:empty_file --no-textconv
+  [ "$status" -eq 0 ]
+  [ "$output" = "" ]
 }
 
 @test "crypt: handle file with problematic bytes" {

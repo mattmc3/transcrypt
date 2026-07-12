@@ -84,6 +84,13 @@ load "$BATS_TEST_DIRNAME/_gpg_helper.bash"
   [ "$status" -ne 0 ]
 }
 
+@test "init: expired recipient key is rejected" {
+  uninstall_transcrypt
+  run $TRANSCRYPT --format=gpg --gpg-recipient="$EXPIRED" --yes
+  [ "$status" -ne 0 ]
+  [[ "$output" = *"not usable"* ]]
+}
+
 @test "init: uninstall leaves decrypted file in working copy" {
   encrypt_named_file sensitive_file "my secret"
 

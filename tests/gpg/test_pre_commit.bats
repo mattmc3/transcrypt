@@ -55,6 +55,32 @@ load "$BATS_TEST_DIRNAME/_gpg_helper.bash"
   [[ "$output" = *"sensitive_file"* ]]
 }
 
+@test "check: --check reports expired recipient keys" {
+  echo "Secret stuff" > sensitive_file
+  encrypt_named_file sensitive_file
+
+  git config --add transcrypt.gpg-recipient "$EXPIRED_FPR"
+
+  run $TRANSCRYPT --check
+  [ "$status" -ne 0 ]
+  [[ "$output" = *"EXPIRED"* ]]
+  [[ "$output" = *"$EXPIRED_FPR"* ]]
+}
+
+@test "check: --check tolerates recipients missing from the keyring" {
+  echo "Secret stuff" > sensitive_file
+  encrypt_named_file sensitive_file
+
+  # CI-like machine: no keys at all; ciphertext validation still works
+  # and unknown key health must not fail the check
+  emptyhome=$(make_empty_gnupghome)
+  git config --local transcrypt.gnupghome "$emptyhome"
+
+  run $TRANSCRYPT --check
+  [ "$status" -eq 0 ]
+  [[ "$output" = *"not in this keyring"* ]]
+}
+
 @test "pre-commit: reject commit of encrypted file with unencrypted content" {
   echo "Secret stuff" > sensitive_file
   encrypt_named_file sensitive_file

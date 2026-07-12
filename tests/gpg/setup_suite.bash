@@ -15,11 +15,17 @@ setup_suite() {
       --quick-gen-key "$uid" default default never
   done
 
+  # a key that expired long ago, generated in the past via faked time
+  gpg --batch --pinentry-mode loopback --passphrase '' \
+    --faked-system-time '20200101T000000!' \
+    --quick-gen-key "Expired Test <$EXPIRED>" default default 20200201T000000
+
   # canonical fingerprints, for asserting normalized recipient storage
-  export ALICE_FPR BOB_FPR CHARLIE_FPR
+  export ALICE_FPR BOB_FPR CHARLIE_FPR EXPIRED_FPR
   ALICE_FPR=$(fpr_of "$ALICE")
   BOB_FPR=$(fpr_of "$BOB")
   CHARLIE_FPR=$(fpr_of "$CHARLIE")
+  EXPIRED_FPR=$(fpr_of "$EXPIRED")
 }
 
 teardown_suite() {

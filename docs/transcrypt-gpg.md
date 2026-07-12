@@ -83,12 +83,45 @@ Consequences:
 - A machine holding only public keys can clone and read ciphertext but
   cannot `git add` encrypted files.
 
-## Not supported (yet)
+## Validating a repository: --check
 
-- `--upgrade` on a gpg-format repository
-- Multiple contexts (`--context=NAME`) with the gpg format
-- Interactive (non `--yes`) configuration flow shows password prompts
-  that do not apply to this format
+`transcrypt --check` verifies that every encrypted file in the index is
+valid ciphertext, and reports the health of every configured recipient
+key (expired, revoked, disabled, expiring within 30 days, or absent
+from the keyring). It needs no keys and no prior configuration, so a CI
+job can run it to catch corrupted or plaintext-staged secrets from
+collaborators who never installed the pre-commit hook:
+
+```sh
+./transcrypt --check
+```
+
+The pre-commit hook performs the same ciphertext validation on every
+commit; PGP armor carries a checksum, so a hand-edited or corrupted
+secret is detected even on machines that hold no key.
+
+## Safety behavior worth knowing
+
+- Merging: if a secret cannot be decrypted (no secret key), the merge
+  driver aborts rather than merging raw ciphertext and re-encrypting
+  the garbage. Resolve such merges on a machine with a secret key.
+- Rekeying: a file that cannot be decrypted fails the rekey loudly
+  instead of silently keeping the old recipient list.
+- Expired keys cannot cause data loss. Expiry blocks *encryption* only;
+  decryption works forever with the secret key. If every recipient key
+  expires, the repo is temporarily read-only until a key is renewed
+  (`gpg --quick-set-expire <fpr> 2y`) or replaced, then rekeyed.
+- Real data loss requires losing every recipient *secret key*. Guard
+  against it with a dedicated recovery keypair: keep its secret key
+  offline and add its fingerprint as a standing recipient.
+
+## Not supported with the gpg format
+
+These refuse with an error rather than half-working: `--upgrade`,
+`--flush-credentials` (no local credentials exist), contexts
+(`--context=NAME`), and `--export-gpg` / `--import-gpg` (no password to
+carry). The interactive (non `--yes`) configure flow also still shows
+password prompts that do not apply to this format.
 
 ## Removing a recipient is not revocation
 

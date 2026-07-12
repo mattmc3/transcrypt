@@ -34,6 +34,11 @@ The transcrypt source code and full documentation may be downloaded from
     --format=gpg. Keys must be in the gpg keyring (set
     transcrypt.gnupghome to use an alternate keyring)
 
+  * `--check`:
+    verify that every encrypted file in the index is valid ciphertext
+    and report recipient key health; needs no configuration or keys,
+    for use in CI
+
   * `--set-openssl-path`=<path_to_openssl>:
     use OpenSSL at this path; defaults to 'openssl' in $PATH
 

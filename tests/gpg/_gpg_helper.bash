@@ -8,6 +8,7 @@ source "$BATS_TEST_DIRNAME/../_test_helper.bash"
 export ALICE='alice@example.com'
 export BOB='bob@example.com'
 export CHARLIE='charlie@example.com'
+export EXPIRED='expired@example.com'
 
 function init_transcrypt_gpg {
   "$TRANSCRYPT" --format=gpg \
