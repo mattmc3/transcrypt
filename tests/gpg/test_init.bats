@@ -82,6 +82,16 @@ load "$BATS_TEST_DIRNAME/_gpg_helper.bash"
   [ "$status" -ne 0 ]
 }
 
+@test "init: interactive gpg configure shows recipients, not password prompts" {
+  uninstall_transcrypt
+  run bash -c "printf 'y\n' | $TRANSCRYPT --format=gpg --gpg-recipient=$ALICE"
+  [ "$status" -eq 0 ]
+  [[ "$output" = *"FORMAT:   gpg"* ]]
+  [[ "$output" = *"$ALICE_FPR"* ]]
+  [[ "$output" != *"PASSWORD"* ]]
+  [[ "$output" != *"Generate a random password"* ]]
+}
+
 @test "init: expired recipient key is rejected" {
   uninstall_transcrypt
   run $TRANSCRYPT --format=gpg --gpg-recipient="$EXPIRED" --yes

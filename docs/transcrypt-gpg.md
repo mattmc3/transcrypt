@@ -114,14 +114,16 @@ secret is detected even on machines that hold no key.
 - Real data loss requires losing every recipient *secret key*. Guard
   against it with a dedicated recovery keypair: keep its secret key
   offline and add its fingerprint as a standing recipient.
+- `transcrypt --add` marks gpg patterns `-text` so eol conversion
+  (`core.autocrlf`) never touches armored ciphertext or restored
+  plaintext; secret files round-trip byte-exact.
 
 ## Not supported with the gpg format
 
 These refuse with an error rather than half-working: `--upgrade`,
 `--flush-credentials` (no local credentials exist), contexts
 (`--context=NAME`), and `--export-gpg` / `--import-gpg` (no password to
-carry). The interactive (non `--yes`) configure flow also still shows
-password prompts that do not apply to this format.
+carry).
 
 ## Removing a recipient is not revocation
 

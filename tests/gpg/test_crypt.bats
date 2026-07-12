@@ -247,6 +247,35 @@ PGP_HEADER="-----BEGIN PGP MESSAGE-----"
   [ "$output" = "" ]
 }
 
+@test "crypt: --add marks gpg patterns -text to block eol conversion" {
+  run $TRANSCRYPT --add='*.secret'
+  [ "$status" -eq 0 ]
+  run cat .gitattributes
+  [[ "$output" = *'*.secret  filter=crypt diff=crypt merge=crypt -text'* ]]
+}
+
+@test "crypt: crlf content round-trips byte-exact under autocrlf" {
+  git config --local core.autocrlf true
+  $TRANSCRYPT --add=winfile
+  printf 'line1\r\nline2\r\n' > winfile
+  git add .gitattributes winfile
+  git commit -m 'win secret'
+
+  cp winfile "$BATS_TEST_TMPDIR/orig"
+  rm winfile
+  git checkout --force -- winfile
+  run cmp winfile "$BATS_TEST_TMPDIR/orig"
+  [ "$status" -eq 0 ]
+}
+
+@test "crypt: interactive rekey confirm shows recipients, not password" {
+  encrypt_named_file sensitive_file "$SECRET_CONTENT"
+  run bash -c "printf 'y\n' | $TRANSCRYPT --rekey"
+  [ "$status" -eq 0 ]
+  [[ "$output" = *"RECIPIENTS"* ]]
+  [[ "$output" != *"PASSWORD"* ]]
+}
+
 @test "crypt: handle file with problematic bytes" {
   FILENAME="problem bytes file.txt"
   printf "\375 \0 shh" > "$FILENAME"

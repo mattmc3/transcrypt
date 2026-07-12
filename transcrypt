@@ -869,8 +869,14 @@ git_pre_commit() {
 
 # Add file patterns to .gitattributes
 add_pattern() {
+	# secret files must round-trip byte-exact; -text keeps eol conversion
+	# (core.autocrlf) away from armored ciphertext and restored plaintext
+	local eol_attr=''
+	if is_gpg_format; then
+		eol_attr=' -text'
+	fi
 	for var in "$@"; do
-		line="$var  filter=crypt${CONTEXT_CRYPT_SUFFIX} diff=crypt${CONTEXT_CRYPT_SUFFIX} merge=crypt${CONTEXT_CRYPT_SUFFIX}"
+		line="$var  filter=crypt${CONTEXT_CRYPT_SUFFIX} diff=crypt${CONTEXT_CRYPT_SUFFIX} merge=crypt${CONTEXT_CRYPT_SUFFIX}${eol_attr}"
 		grep -qxF "$line" "${GIT_ATTRIBUTES}" || echo "$line" >>"${GIT_ATTRIBUTES}"
 		sync
 	done
@@ -994,6 +1000,32 @@ get_password() {
 	done
 }
 
+# print the format-specific settings section of a confirmation prompt
+print_pending_configuration() {
+	printf 'The following configuration will be saved:\n\n'
+	printf '  CONTEXT:  %s\n' "$CONTEXT"
+	if [[ $format == 'gpg' ]]; then
+		printf '  FORMAT:   gpg\n'
+		printf '  RECIPIENTS:\n'
+		local recipient
+		while IFS= read -r recipient; do
+			if [[ $recipient ]]; then
+				printf '    %s\n' "$recipient"
+			fi
+		done < <(
+			if [[ ${#gpg_recipients[@]} -gt 0 ]]; then
+				printf '%s\n' "${gpg_recipients[@]}"
+			else
+				load_gpg_recipients
+			fi
+		)
+		printf '\n'
+	else
+		printf '  CIPHER:   %s\n' "$cipher"
+		printf '  PASSWORD: %s\n\n' "$password"
+	fi
+}
+
 # confirm the transcrypt configuration
 confirm_configuration() {
 	local answer=
@@ -1002,10 +1034,7 @@ confirm_configuration() {
 	[[ ! $REPO ]] || printf '  GIT_WORK_TREE:  %s\n' "$REPO"
 	printf '  GIT_DIR:        %s\n' "$GIT_DIR"
 	printf '  GIT_ATTRIBUTES: %s\n\n' "$GIT_ATTRIBUTES"
-	printf 'The following configuration will be saved:\n\n'
-	printf '  CONTEXT:  %s\n' "$CONTEXT"
-	printf '  CIPHER:   %s\n' "$cipher"
-	printf '  PASSWORD: %s\n\n' "$password"
+	print_pending_configuration
 	printf 'Does this look correct? [Y/n] '
 	read -r -n 1 -s answer
 
@@ -1026,10 +1055,7 @@ confirm_rekey() {
 	[[ ! $REPO ]] || printf '  GIT_WORK_TREE:  %s\n' "$REPO"
 	printf '  GIT_DIR:        %s\n' "$GIT_DIR"
 	printf '  GIT_ATTRIBUTES: %s\n\n' "$GIT_ATTRIBUTES"
-	printf 'The following configuration will be saved:\n\n'
-	printf '  CONTEXT:  %s\n' "$CONTEXT"
-	printf '  CIPHER:   %s\n' "$cipher"
-	printf '  PASSWORD: %s\n\n' "$password"
+	print_pending_configuration
 	printf 'You are about to re-encrypt all encrypted files using new credentials.\n'
 	printf 'Once you do this, their historical diffs will no longer display in plain text.\n\n'
 	printf 'Proceed with rekey? [y/N] '
